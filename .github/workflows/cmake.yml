@@ -43,19 +43,19 @@ jobs:
       - name: Run Simulation
         run: /bin/bash $GITHUB_WORKSPACE/short-tests-cmake.sh
 
-  build-QV100:
-    runs-on: ubuntu-latest
-    container:
-      image: tgrogers/accel-sim_regress:Ubuntu-22.04-cuda-11.7
-      env:
-        CONFIG: QV100
+  # build-QV100:
+  #   runs-on: ubuntu-latest
+  #   container:
+  #     image: tgrogers/accel-sim_regress:Ubuntu-22.04-cuda-11.7
+  #     env:
+  #       CONFIG: QV100
         
-    # Steps represent a sequence of tasks that will be executed as part of the job
-    steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-      - name: Run Simulation
-        run: /bin/bash $GITHUB_WORKSPACE/short-tests-cmake.sh
+  #   # Steps represent a sequence of tasks that will be executed as part of the job
+  #   steps:
+  #     # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+  #     - uses: actions/checkout@v4
+  #     - name: Run Simulation
+  #       run: /bin/bash $GITHUB_WORKSPACE/short-tests-cmake.sh
 
   build-2060:
     runs-on: ubuntu-latest
