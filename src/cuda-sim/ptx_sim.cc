@@ -38,6 +38,9 @@ typedef void *yyscan_t;
 
 void feature_not_implemented(const char *f);
 
+/*
+ptx_cta_info 包含一个合作线程阵列（CTA）中的线程集合的线程状态（ptx_thread_info）。
+*/
 ptx_cta_info::ptx_cta_info(unsigned sm_idx, gpgpu_context *ctx) {
   assert(ctx->func_sim->g_ptx_cta_info_sm_idx_used.find(sm_idx) ==
          ctx->func_sim->g_ptx_cta_info_sm_idx_used.end());

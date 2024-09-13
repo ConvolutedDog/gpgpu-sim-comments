@@ -8,10 +8,15 @@
 #include "../src/gpgpusim_entrypoint.h"
 #include "cuda_api_object.h"
 
+/*
+GPGPU的上下文信息。
+*/
 class gpgpu_context {
  public:
   gpgpu_context() {
+    //全局文件符号表设置为空。symbol_table 类在ptx_ir.h中定义。
     g_global_allfiles_symbol_table = NULL;
+    //全局变量，用于标记每次访存操作（memory_access_t）的唯一ID，在每次访存操作时加1。
     sm_next_access_uid = 0;
     warp_inst_sm_next_uid = 0;
     operand_info_sm_next_uid = 1;
@@ -20,7 +25,9 @@ class gpgpu_context {
     g_ptx_cta_info_uid = 1;
     symbol_sm_next_uid = 1;
     function_info_sm_next_uid = 1;
+    //设置Tensor Core的DEBUG模式关闭。
     debug_tensorcore = 0;
+    //创建CUDA运行时API。
     api = new cuda_runtime_api(this);
     ptxinfo = new ptxinfo_data(this);
     ptx_parser = new ptx_recognizer(this);

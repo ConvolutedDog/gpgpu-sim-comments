@@ -47,6 +47,12 @@ typedef void *yyscan_t;
 
 #define STR_SIZE 1024
 
+/*
+传入参数 PC 值，获取该 PC 值对应的PTX指令，该指令为 ptx_instruction 类的对象。s_g_pc_to_insn 如下定义：
+    std::vector<ptx_instruction *>
+          s_g_pc_to_insn;  // a direct mapping from PC to instruction
+是 PC 值 --> ptx_instruction 的映射。
+*/
 const ptx_instruction *gpgpu_context::pc_to_instruction(unsigned pc) {
   if (pc < s_g_pc_to_insn.size())
     return s_g_pc_to_insn[pc];
@@ -242,10 +248,16 @@ bool symbol_table::add_function_decl(const char *name, int entry_point,
     // it to the micro-architectural register to the performance simulator.
     // For this purpose we add a symbol to the symbol table but
     // mark it as a non_arch_reg so it does not effect the performance sim.
+    //用于支持表示为"_"的寄存器的初始设置代码。当未读取或写入指令操作数时，使用此寄存器。然而，解析器
+    //必须将其识别为合法的寄存器，但我们不想将其传递给微体系结构寄存器，传递给性能模拟器。为此，我们向
+    //符号表中添加一个符号，但将其标记为non_arch_reg，这样不会影响性能模拟。 
+    //将带有"_"寄存器的指令中的"_"设置为null_key，并设置null_key.set_is_non_arch_reg()。
     type_info_key null_key(reg_space, 0, 0, 0, 0, 0);
     null_key.set_is_non_arch_reg();
     // First param is null - which is bad.
     // However, the first parameter is actually unread in the constructor...
+    //第一个参数为空-这是错误的。然而，第一个参数实际上在构造函数中没有读。
+
     // TODO - remove the symbol_table* from type_info
     type_info *null_type_info = new type_info(NULL, null_key);
     symbol *null_reg =
@@ -327,6 +339,9 @@ unsigned operand_info::get_uid() {
   return result;
 }
 
+/*
+find_next_real_instruction 用于找到下一条非is_label()的指令。如果i指向的指令是label，就再i++。
+*/
 std::list<ptx_instruction *>::iterator
 function_info::find_next_real_instruction(
     std::list<ptx_instruction *>::iterator i) {
@@ -334,32 +349,99 @@ function_info::find_next_real_instruction(
   return i;
 }
 
+/*
+将各个指令分组为基本块（basic_block_t）。m_instructions 保存了 function_info 对象的所有PTX指
+令。该函数执行完毕后，会将所有 PTX 指令分为基本块，添加到 m_basic_blocks 中。m_basic_blocks是
+基本块类型的向量：std::vector<basic_block_t *> m_basic_blocks。例如下列 PTX 指令：
+m_instructions保存了下列所有条指令：
+    ld.param.u64 %rd18, [_Z6MatMulPiS_S_i_param_0];   |          -->ptx_begin/leaders[0]
+    ......                                            |->m_basic_blocks[0]
+    @%p1 bra $L__BB0_7;                               |          -->ptx_end
+
+    add.s32 %r15, %r12, -1;                           |          -->ptx_begin/leaders[1]
+    ......                                            |->m_basic_blocks[1]
+    @%p2 bra $L__BB0_4;                               |          -->ptx_end
+
+    sub.s32 %r33, %r12, %r35;                         |          -->ptx_begin/leaders[2]
+    ......                                            |->m_basic_blocks[2]
+    mul.wide.s32 %rd5, %r12, 4;                       |          -->ptx_end
+
+    $L__BB0_3:                                        |          -->ptx_begin/leaders[3]
+    ld.global.u32 %r18, [%rd30+-8];                   |->m_basic_blocks[3]
+    ......                                            |
+    @%p3 bra $L__BB0_3;                               |          -->ptx_end
+
+    $L__BB0_4:                                        |          -->ptx_begin/leaders[4]
+    setp.eq.s32 %p4, %r35, 0;                         |->m_basic_blocks[4]
+    @%p4 bra $L__BB0_7;                               |          -->ptx_end
+
+    mad.lo.s32 %r26, %r34, %r12, %r1;                 |          -->ptx_begin/leaders[5]
+    ......                                            |->m_basic_blocks[5]
+    add.s64 %rd32, %rd2, %rd26;                       |          -->ptx_end
+
+    $L__BB0_6:                                        |          -->ptx_begin/leaders[6]
+    .pragma "nounroll";                               |->m_basic_blocks[6]
+    ......                                            |
+    @%p5 bra $L__BB0_6;                               |          -->ptx_end
+
+    $L__BB0_7:                                        |          -->ptx_begin/leaders[7]
+    cvta.to.global.u64 %rd27, %rd17;                  |->m_basic_blocks[7]
+    ......                                            |
+    ret;                                              |          -->ptx_end
+*/
 void function_info::create_basic_blocks() {
+  //leaders保存了一个代码块的首条指令。需要注意的是，一个代码块的结尾指令一般是 bra、ret、exit、
+  //retp、break、call、callp 等指令，它们是跳转功能指令，代表了一个代码块的结尾；因此这条指令的
+  //后面一条指令肯定是个新代码块的首条指令。
   std::list<ptx_instruction *> leaders;
   std::list<ptx_instruction *>::iterator i, l;
 
   // first instruction is a leader
+  //m_instructions 的首条指令肯定属于第一个代码块，因此该首条指令是一个 leader。
   i = m_instructions.begin();
   leaders.push_back(*i);
   i++;
+  //对m_instructions中除去首条指令之外的所有其余指令循环。
   while (i != m_instructions.end()) {
+    //pI指向的是当前处理的指令。
     ptx_instruction *pI = *i;
+    //is_label() 用于判断指令pI是否含有标签。label即为例如PTX指令块中的$L__BB0_6等：
+    //  01.$L__BB0_6: <---- label
+    //  02.  .pragma "nounroll";
+    //  03.  ld.global.u32 %r28, [%rd32];
+    //  04.  ...
+    //  ...  ...
+    //  12.  @%p5 bra $L__BB0_6; <---- label = $L__BB0_6
     if (pI->is_label()) {
+      //如果pI是标签，代表它是代码块的首条指令，则直接将它压入leaders末端。
       leaders.push_back(pI);
+      //find_next_real_instruction 用于找到下一条非is_label()的指令，如果i指向的指令是label，
+      //就再i++。。其定义为：
+      //  std::list<ptx_instruction *>::iterator function_info::
+      //  find_next_real_instruction(std::list<ptx_instruction *>::iterator i) {
+      //    while ((i != m_instructions.end()) && (*i)->is_label()) i++;
+      //    return i;
+      //  }
       i = find_next_real_instruction(++i);
     } else {
+      //如果pI不是标签，需要判断操作码。因为，bra、ret、exit、retp、break、call、callp 这些指
+      //令一般是一个代码块的结尾。
       switch (pI->get_opcode()) {
-        case BRA_OP:
-        case RET_OP:
-        case EXIT_OP:
-        case RETP_OP:
-        case BREAK_OP:
+        //bra、ret、exit、retp、break一般是一个代码块的结尾，因此把 i++ 后的下一条指令直接压入
+        //leaders末端。
+        case BRA_OP:   //bra指令。
+        case RET_OP:   //ret指令。
+        case EXIT_OP:  //exit指令。
+        case RETP_OP:  //retp指令。
+        case BREAK_OP: //break指令。
           i++;
           if (i != m_instructions.end()) leaders.push_back(*i);
           i = find_next_real_instruction(i);
           break;
-        case CALL_OP:
-        case CALLP_OP:
+        case CALL_OP:  //call指令。
+        case CALLP_OP: //callp指令。
+          //如果该条指令有谓词寄存器，则一般是一个代码块的结尾，因此把 i++ 后的下一条指令直接压入
+          //leaders末端。
           if (pI->has_pred()) {
             printf("GPGPU-Sim PTX: Warning found predicated call\n");
             i++;
@@ -374,23 +456,55 @@ void function_info::create_basic_blocks() {
     }
   }
 
+  //如果leaders为空，则该函数没有基本块。
   if (leaders.empty()) {
     printf("GPGPU-Sim PTX: Function \'%s\' has no basic blocks\n",
            m_name.c_str());
     return;
   }
 
+  //bb_id是basic block的唯一标识，每次添加一个基本块的时候要加1。
   unsigned bb_id = 0;
   l = leaders.begin();
   i = m_instructions.begin();
+  //m_basic_blocks是基本块类型的向量：
+  //    std::vector<basic_block_t *> m_basic_blocks;
+  //l指向的是由首条指令起始的第一个入口基本块，将该基本块加入到m_basic_blocks。
+  //basic_block_t类在ptx_ir.h中定义，其构造函数：
+  //  basic_block_t(unsigned ID, ptx_instruction *begin, ptx_instruction *end,
+  //                bool entry, bool ex) {
+  //    //basic block的唯一标识。
+  //    bb_id = ID;
+  //    //ptx_begin是该基本块的首条PTX指令。
+  //    ptx_begin = begin;
+  //    //ptx_end是该基本块的末尾PTX指令。
+  //    ptx_end = end;
+  //    //is_entry标志该基本块是否是入口处的基本块。
+  //    is_entry = entry;
+  //    //is_exit标志该基本块是否是出口处的基本块。
+  //    is_exit = ex;
+  //    immediatepostdominator_id = -1;
+  //    immediatedominator_id = -1;
+  //  }
+  //因此 begin 指向的是 m_instructions 的第一条指令；*end 后面找到了再赋值；entry 置1；ex置0。
+  //*find_next_real_instruction(i)是因为，前面 i 指向的是 m_instructions.begin()，而在之前把
+  //基本块的首条指令加入到 m_basic_blocks 时，find_next_real_instruction(i) 是找到非label指令，
+  //但我觉得这里没什么太大必要，因为一个 function_info 中的首条指令肯定不会是 label。
   m_basic_blocks.push_back(
       new basic_block_t(bb_id++, *find_next_real_instruction(i), NULL, 1, 0));
+  //last_real_inst是处理leaders中的某条指令时，上一个指令由last_real_inst指向，代表上一个代码块
+  //的结尾。l++是因为上面添加一个基本块时，l已经是一个基本块的开始指令，然后last_real_inst是用来
+  //在处理下一个基本块的首条指令时，为上一个基本块的末尾指令ptx_end赋值。l++执行完毕后即指向了下一
+  //个代码块的起始指令。
   ptx_instruction *last_real_inst = *(l++);
-
+  //后面对 m_instructions 中的指令进行循环，依次处理每条指令所在的代码块。
   for (; i != m_instructions.end(); i++) {
     ptx_instruction *pI = *i;
+    //如果 i 所指向的指令 == l 所指向的指令，即发现下一个基本块。因为上面l++执行完毕后即指向了下一
+    //个代码块的起始指令。
     if (l != leaders.end() && *i == *l) {
       // found start of next basic block
+      //为上一个基本块的 ptx_end 赋值为 last_real_inst。
       m_basic_blocks.back()->ptx_end = last_real_inst;
       if (find_next_real_instruction(i) !=
           m_instructions.end()) {  // if not bogus trailing label
@@ -402,6 +516,8 @@ void function_info::create_basic_blocks() {
       l++;
     }
     pI->assign_bb(m_basic_blocks.back());
+    //对每一条指令循环时，循环一次，last_real_inst就赋值为当前指令 PI。这样在发现下一个代码块时，
+    //就可以直接将上一个代码块的ptx_end赋值为last_real_inst。
     if (!pI->is_label()) last_real_inst = pI;
   }
   m_basic_blocks.back()->ptx_end = last_real_inst;
@@ -469,11 +585,17 @@ void function_info::print_basic_block_links() {
     printf("\n");
   }
 }
+
+/*
+找到 break 指令跳转到的目标基本块。
+*/
 operand_info *function_info::find_break_target(
     ptx_instruction *p_break_insn)  // find the target of a break instruction
 {
+  //break_bb指向的是 break 指令所在的基本块。
   const basic_block_t *break_bb = p_break_insn->get_bb();
   // go through the dominator tree
+  //遍历必经结点树。
   for (const basic_block_t *p_bb = break_bb; p_bb->immediatedominator_id != -1;
        p_bb = m_basic_blocks[p_bb->immediatedominator_id]) {
     // reverse search through instructions in basic block for breakaddr
@@ -503,28 +625,54 @@ operand_info *function_info::find_break_target(
 
   return NULL;
 }
+
+/*
+将基本块连接起来，形成控制流图。
+*/
 void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
                                             // function, connecting basic blocks
                                             // together
 {
+  //代码基本块（basic block）迭代器。
   std::vector<basic_block_t *>::iterator bb_itr;
   std::vector<basic_block_t *>::iterator bb_target_itr;
+  //m_basic_blocks的出口基本块。
   basic_block_t *exit_bb = m_basic_blocks.back();
 
   // start from first basic block, which we know is the entry point
+  //从第一个基本块开始，我们知道这是切入点。
   bb_itr = m_basic_blocks.begin();
+  //对每个代码基本块循环。
   for (bb_itr = m_basic_blocks.begin(); bb_itr != m_basic_blocks.end();
        bb_itr++) {
+    //pI 指向的是当前基本块的 ptx_end 末尾指令。
     ptx_instruction *pI = (*bb_itr)->ptx_end;
+    //(*bb_itr)->is_exit为真标志着，当前基本块是整个 function_info 的最后一个基本块，即出口点。
+    //它的 ptx_end 不需要连接。
     if ((*bb_itr)->is_exit)  // reached last basic block, no successors to link
       continue;
+    //ret指令：
+    //    将执行返回到调用方的环境。发散返回将挂起线程，直到所有线程都准备好返回调用方。这允许多
+    //    个不同的ret指令。常用方法：
+    //           ret;
+    //        @p ret;
+    //exit指令：
+    //    结束线程的执行。当线程退出时，系统将检查等待所有线程的障碍，以查看退出的线程是否是尚未
+    //    到达barrier{.cta}（CTA中的所有线程）或barrier.cluster（群集中的所有线程）的唯一线程。
+    //    如果退出线程阻挡了屏障，则释放屏障。常用方法：
+    //           exit;
+    //        @p exit;
     if (pI->get_opcode() == RETP_OP || pI->get_opcode() == RET_OP ||
         pI->get_opcode() == EXIT_OP) {
+      //当前基本块 bb_itr 的后继者是 exit_bb。
       (*bb_itr)->successor_ids.insert(exit_bb->bb_id);
+      //exit_bb 的前继者是 当前基本块 bb_itr。
       exit_bb->predecessor_ids.insert((*bb_itr)->bb_id);
+      //如果 retp、ret、exit 指令有谓词寄存器，说明还有接下来一个基本块。
       if (pI->has_pred()) {
         printf("GPGPU-Sim PTX: Warning detected predicated return/exit.\n");
         // if predicated, add link to next block
+        //通过 pI 在指令存储中的索引找下一条指令所在的基本块，连接过程同上。
         unsigned next_addr = pI->get_m_instr_mem_index() + pI->inst_size();
         if (next_addr < m_instr_mem_size && m_instr_mem[next_addr]) {
           basic_block_t *next_bb = m_instr_mem[next_addr]->get_bb();
@@ -534,6 +682,7 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       }
       continue;
     } else if (pI->get_opcode() == BRA_OP) {
+      //带谓词寄存器的 bra 指令的连接。
       // find successor and link that basic_block to this one
       operand_info &target = pI->dst();  // get operand, e.g. target name
       unsigned addr = labels[target.name()];
@@ -547,6 +696,7 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       // if basic block does not end in an unpredicated branch,
       // then next basic block is also successor
       // (this is better than testing for .uni)
+      //带谓词寄存器的 bra 指令的连接，非预测跳转。
       unsigned next_addr = pI->get_m_instr_mem_index() + pI->inst_size();
       basic_block_t *next_bb = m_instr_mem[next_addr]->get_bb();
       (*bb_itr)->successor_ids.insert(next_bb->bb_id);
@@ -555,26 +705,40 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       assert(pI->get_opcode() == BRA_OP);
   }
 }
+
+/*
+在该函数执行之前，已经执行过[基本块连接任务-connect_basic_blocks()]，但是这时候仅仅是按照每个基本块的
+前后顺序进行了连接，没有针对 break 指令的跳转目标进行连接。因此下面的函数是分析PTX代码中的所有 break 
+指令，并依据他们的跳转目标、或者是否是预测跳转来进行基本块连接上的修改。
+*/
 bool function_info::connect_break_targets()  // connecting break instructions
                                              // with proper targets
 {
+  //基本块迭代器。
   std::vector<basic_block_t *>::iterator bb_itr;
   std::vector<basic_block_t *>::iterator bb_target_itr;
   bool modified = false;
 
   // start from first basic block, which we know is the entry point
+  //从第一个基本块开始，第一个基本块是函数的入口。
   bb_itr = m_basic_blocks.begin();
   for (bb_itr = m_basic_blocks.begin(); bb_itr != m_basic_blocks.end();
        bb_itr++) {
     basic_block_t *p_bb = *bb_itr;
+    //pI指向的是基本块的最末尾指令。
     ptx_instruction *pI = p_bb->ptx_end;
+    //如果p_bb指向的是最后一个基本块，即函数的出口的话，就没有后继结点需要连接到它。
     if (p_bb->is_exit)  // reached last basic block, no successors to link
       continue;
+    //对操作码为 break 的指令进行处理。
     if (pI->get_opcode() == BREAK_OP) {
       // backup existing successor_ids for stability check
+      //备份现有的successor_id以进行稳定性检查，orig_successor_ids指向的是现有的successor_id，即后
+      //继结点的编号。
       std::set<int> orig_successor_ids = p_bb->successor_ids;
 
       // erase the previous linkage with old successors
+      //删除之前执行[基本块连接任务-connect_basic_blocks()]时，p_bb与后继结点的链接。
       for (std::set<int>::iterator succ_ids = p_bb->successor_ids.begin();
            succ_ids != p_bb->successor_ids.end(); ++succ_ids) {
         basic_block_t *successor_bb = m_basic_blocks[*succ_ids];
@@ -584,6 +748,7 @@ bool function_info::connect_break_targets()  // connecting break instructions
 
       // find successor and link that basic_block to this one
       // successor of a break is set by an preceeding breakaddr instruction
+      //找到后继结点，并将该 basic_block 链接到 p_bb。
       operand_info *target = find_break_target(pI);
       unsigned addr = labels[target->name()];
       ptx_instruction *target_pI = m_instr_mem[addr];
@@ -591,6 +756,9 @@ bool function_info::connect_break_targets()  // connecting break instructions
       p_bb->successor_ids.insert(target_bb->bb_id);
       target_bb->predecessor_ids.insert(p_bb->bb_id);
 
+      //如果pI指向的PTX指令有谓词，则属于预测跳转。一方面，前面已经将其所在基本块与跳转到的目标基本块
+      //进行连接，这是在预测成功的条件下；另一方面，如果预测失败，则仍旧沿着顺序基本块执行，因此还需要
+      //将其与顺序下一个基本块进行连接。
       if (pI->has_pred()) {
         // predicated break - add link to next basic block
         unsigned next_addr = pI->get_m_instr_mem_index() + pI->inst_size();
@@ -599,19 +767,32 @@ bool function_info::connect_break_targets()  // connecting break instructions
         next_bb->predecessor_ids.insert(p_bb->bb_id);
       }
 
+      //返回是否由于 break 指令的存在，对基本块之间的连接进行了修改。
       modified = modified || (orig_successor_ids != p_bb->successor_ids);
     }
   }
 
   return modified;
 }
+
+/*
+执行PDOM（分支处理中的后必经结点）检测。
+*/
 void function_info::do_pdom() {
+  //将各个指令分组为基本块（basic_block_t）。
   create_basic_blocks();
+  //将基本块连接起来，形成控制流图。
   connect_basic_blocks();
   bool modified = false;
   do {
+    //寻找一个函数的完整PTX指令中，每一个（基本块）结点的必经结点（dominators）。
     find_dominators();
+    //寻找一个函数的完整PTX指令中，每一个（基本块）结点的直接必经结点（immediate dominators）。
     find_idominators();
+    //在该函数执行之前，已经执行过[基本块连接任务-connect_basic_blocks()]，但是这时候仅仅是按照每个
+    //基本块的前后顺序进行了连接，没有针对 break 指令的跳转目标进行连接。因此下面的函数是分析PTX代码
+    //中的所有 break 指令，并依据他们的跳转目标、或者是否是预测跳转来进行基本块连接上的修改。modified 
+    //返回的是：是否由于 break 指令的存在，对基本块之间的连接进行了修改。
     modified = connect_break_targets();
   } while (modified == true);
 
@@ -623,7 +804,9 @@ void function_info::do_pdom() {
   if (g_debug_execution >= 2) {
     print_dominators();
   }
+  //寻找一个函数的完整PTX指令中，每一个（基本块）结点的后必经结点（post-dominators）。
   find_postdominators();
+  //寻找一个函数的完整PTX指令中，每一个（基本块）结点的直接后必经结点（immediate post-dominators）。
   find_ipostdominators();
   if (g_debug_execution >= 50) {
     print_postdominators();
@@ -631,6 +814,7 @@ void function_info::do_pdom() {
   }
   printf("GPGPU-Sim PTX: pre-decoding instructions for \'%s\'...\n",
          m_name.c_str());
+  //对m_instr_mem中的每一条指令进行预解码。
   for (unsigned ii = 0; ii < m_n;
        ii += m_instr_mem[ii]->inst_size()) {  // handle branch instructions
     ptx_instruction *pI = m_instr_mem[ii];
@@ -669,20 +853,69 @@ void print_set(const std::set<int> &A) {
   printf("\n");
 }
 
+/*
+必经结点（dominators）：如果从entry结点到结点i的每一条可能的执行路径都包含d，则结点d是结点i的必经结
+                       点，记为d dom i。
+直接必经结点（immediate dominators）：对于a≠b，当且仅当a dom b且不存在一个c≠a且c≠b的结点c，使得a 
+                                     dom c且c dom b，则称a是b的直接必经结点，记为a idom b。
+后必经结点（post-dominator）：从结点i到exit结点的每一条可能的执行路径都包含p，则结点p是结点i的后必经
+                             结点，记为p pdom i。
+寻找一个函数的完整PTX指令中，每一个（基本块）结点的必经结点（dominators）。例如，下述基本块之间的连接
+图：
+           entry
+            \|/
+   <———Yes—— B1 ——No———>
+ \|/                   \|/
+  B2                    B3
+  |                    \|/
+  |            <——No——— B4 <—
+  |            |       \|/   |
+  |            |       Yes   |
+  |           \|/      \|/   |
+  |            B5       B6 ——
+ \|/__________\|/
+       \|/
+       exit
+它的每一个基本块的必经结点集合为：
+    i     |    Domin(i)
+    entry |    {entry}
+    B1    |    {entry,B1}
+    B2    |    {entry,B1,B2}
+    B3    |    {entry,B1,B3}
+    B4    |    {entry,B1,B3,B4}
+    B5    |    {entry,B1,B3,B4,B5}
+    B6    |    {entry,B1,B3,B4,B6}
+    exit  |    {entry,B1,exit}
+*/
 void function_info::find_dominators() {
   // find dominators using algorithm of Muchnick's Adv. Compiler Design &
   // Implemmntation Fig 7.14
+  //使用了《高级编译器设计与实现(Steven.S.Muchnick著)》的图7.14中的算法。
   printf("GPGPU-Sim PTX: Finding dominators for \'%s\'...\n", m_name.c_str());
   fflush(stdout);
   assert(m_basic_blocks.size() >= 2);  // must have a distinquished entry block
+  //基本块的迭代器。
   std::vector<basic_block_t *>::iterator bb_itr = m_basic_blocks.begin();
+  //首先，bb_itr指向的是函数的入口基本块，这个入口基本块的必经结点集合中只有其自己。
   (*bb_itr)->dominator_ids.insert(
       (*bb_itr)->bb_id);  // the only dominator of the entry block is the entry
   // copy all basic blocks to all dominator lists EXCEPT for the entry block
+  //依据图7.14中算法，初始化除入口基本块的其余所有基本块的必经结点集合，将其初始化为所有的基本块。即，
+  //例如一个程序流图中有entry基本块、exit基本块、以及A/B基本块，初始化exit基本块、A基本块、B基本块的
+  //的必经结点集合为{entry基本块、exit基本块、A基本块、B基本块}。
   for (++bb_itr; bb_itr != m_basic_blocks.end(); bb_itr++) {
+    //将所有基本块都加入到除entry基本块外所有基本块的必经结点集合中。
     for (unsigned i = 0; i < m_basic_blocks.size(); i++)
       (*bb_itr)->dominator_ids.insert(i);
   }
+  //以下是图7.14中算法的主体，书在腾讯文档GPGPU-Sim文档后面。下述各参数分别对应算法里的内容如下：
+  //    [HERE]                            | [BOOK]
+  //    change                            | change
+  //    m_basic_blocks[h]                 | 结点n
+  //    h                                 | 结点n的id
+  //    std::set<int> T                   | T
+  //    std::set<int>::iterator s         | p的id
+  //    m_basic_blocks[*s]->dominator_ids | Domin(p)
   bool change = true;
   while (change) {
     change = false;
@@ -703,12 +936,47 @@ void function_info::find_dominators() {
   }
   // clean the basic block of dominators of it has no predecessors -- except for
   // entry block
+  //上面的代码对算法中有改动，这里去除非Pred(n)的结点的必经结点。
   bb_itr = m_basic_blocks.begin();
   for (++bb_itr; bb_itr != m_basic_blocks.end(); bb_itr++) {
     if ((*bb_itr)->predecessor_ids.empty()) (*bb_itr)->dominator_ids.clear();
   }
 }
 
+/*
+必经结点（dominators）：如果从entry结点到结点i的每一条可能的执行路径都包含d，则结点d是结点i的必经结
+                       点，记为d dom i。
+直接必经结点（immediate dominators）：对于a≠b，当且仅当a dom b且不存在一个c≠a且c≠b的结点c，使得a 
+                                     dom c且c dom b，则称a是b的直接必经结点，记为a idom b。
+后必经结点（post-dominator）：从结点i到exit结点的每一条可能的执行路径都包含p，则结点p是结点i的后必经
+                             结点，记为p pdom i。
+寻找一个函数的完整PTX指令中，每一个（基本块）结点的后必经结点（post-dominators）。例如，下述基本块之
+间的连接图：
+           entry
+            \|/
+   <———Yes—— B1 ——No———>
+ \|/                   \|/
+  B2                    B3
+  |                    \|/
+  |            <——No——— B4 <—
+  |            |       \|/   |
+  |            |       Yes   |
+  |           \|/      \|/   |
+  |            B5       B6 ——
+ \|/__________\|/
+       \|/
+       exit
+它的每一个基本块的后必经结点集合为：
+    i     |    Domin(i)
+    entry |    {exit,B1,entry}
+    B1    |    {exit,B1}
+    B2    |    {exit,B2}
+    B3    |    {exit,B5,B4,B3}
+    B4    |    {exit,B5,B4}
+    B5    |    {exit,B5}
+    B6    |    {exit,B5,B4,B6}
+    exit  |    {exit}
+*/
 void function_info::find_postdominators() {
   // find postdominators using algorithm of Muchnick's Adv. Compiler Design &
   // Implemmntation Fig 7.14
@@ -746,6 +1014,14 @@ void function_info::find_postdominators() {
   }
 }
 
+/*
+必经结点（dominators）：如果从entry结点到结点i的每一条可能的执行路径都包含d，则结点d是结点i的必经结
+                       点，记为d dom i。
+直接必经结点（immediate dominators）：对于a≠b，当且仅当a dom b且不存在一个c≠a且c≠b的结点c，使得a 
+                                     dom c且c dom b，则称a是b的直接必经结点，记为a idom b。
+后必经结点（post-dominator）：从结点i到exit结点的每一条可能的执行路径都包含p，则结点p是结点i的后必经
+                             结点，记为p pdom i。
+*/
 void function_info::find_ipostdominators() {
   // find immediate postdominator blocks, using algorithm of
   // Muchnick's Adv. Compiler Design & Implemmntation Fig 7.15
@@ -797,6 +1073,40 @@ void function_info::find_ipostdominators() {
   // should
 }
 
+/*
+必经结点（dominators）：如果从entry结点到结点i的每一条可能的执行路径都包含d，则结点d是结点i的必经结
+                       点，记为d dom i。
+直接必经结点（immediate dominators）：对于a≠b，当且仅当a dom b且不存在一个c≠a且c≠b的结点c，使得a 
+                                     dom c且c dom b，则称a是b的直接必经结点，记为a idom b。
+后必经结点（post-dominator）：从结点i到exit结点的每一条可能的执行路径都包含p，则结点p是结点i的后必经
+                             结点，记为p pdom i。
+寻找一个函数的完整PTX指令中，每一个（基本块）结点的直接必经结点（immediate dominators）。例如，下述
+基本块之间的连接图：
+           entry
+            \|/
+   <———Yes—— B1 ——No———>
+ \|/                   \|/
+  B2                    B3
+  |                    \|/
+  |            <——No——— B4 <—
+  |            |       \|/   |
+  |            |       Yes   |
+  |           \|/      \|/   |
+  |            B5       B6 ——
+ \|/__________\|/
+       \|/
+       exit
+它的每一个基本块的直接必经结点集合为：
+    i     |    Domin(i)
+    entry |    NULL
+    B1    |    {entry}
+    B2    |    {B1}
+    B3    |    {B1}
+    B4    |    {B3}
+    B5    |    {B4}
+    B6    |    {B4}
+    exit  |    {B1}
+*/
 void function_info::find_idominators() {
   // find immediate dominator blocks, using algorithm of
   // Muchnick's Adv. Compiler Design & Implemmntation Fig 7.15
@@ -1471,15 +1781,28 @@ ptx_instruction::ptx_instruction(
   }
 }
 
+/*
+调用ptx_instruction::print_insn(FILE *fp)，传入参数stdout，打印指令到屏幕。stdin,stdout,stderr就是
+这个fp，不过它是随着计算机系统的开启默认打开的：其中0就是stdin，表示输入流，指从键盘输入；1代表stdout；
+2代表stderr；1，2默认是显示器。
+*/
 void ptx_instruction::print_insn() const {
   print_insn(stdout);
   fflush(stdout);
 }
 
+/*
+传入参数 FILE *fp，打印指令到该文件。
+*/
 void ptx_instruction::print_insn(FILE *fp) const {
   fprintf(fp, "%s", to_string().c_str());
 }
 
+/*
+将该指令转换为一个字符串，并返回该字符串。C++ 库函数 int snprintf(char *str, size_t size, const char 
+*format, ...) 设将可变参数(...)按照 format 格式化成字符串，并将字符串复制到 str 中，size 为要写入的字
+符的最大数目，超过 size 会被截断。
+*/
 std::string ptx_instruction::to_string() const {
   char buf[STR_SIZE];
   unsigned used_bytes = 0;
@@ -1495,10 +1818,17 @@ std::string ptx_instruction::to_string() const {
                m_source_file.c_str(), m_source_line, m_source.c_str());
   return std::string(buf);
 }
+
+/*
+获取谓词。将谓词作为一个 operand_info 对象操作数信息返回。
+*/
 operand_info ptx_instruction::get_pred() const {
   return operand_info(m_pred, gpgpu_ctx);
 }
 
+/*
+function_info的构造函数。
+*/
 function_info::function_info(int entry_point, gpgpu_context *ctx) {
   gpgpu_ctx = ctx;
   m_uid = (gpgpu_ctx->function_info_sm_next_uid)++;
@@ -1514,6 +1844,7 @@ function_info::function_info(int entry_point, gpgpu_context *ctx) {
   m_kernel_info.smem = 0;
   m_local_mem_framesize = 0;
   m_args_aligned_size = -1;
+  //初始化寻找后支配者完成状态为 False。
   pdom_done = false;  // initialize it to false
 }
 

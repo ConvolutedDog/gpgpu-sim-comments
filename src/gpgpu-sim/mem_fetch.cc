@@ -102,6 +102,40 @@ void mem_fetch::print(FILE *fp, bool print_inst) const {
     fprintf(fp, "\n");
 }
 
+/*
+设置内存请求的状态，和状态变化所处的时钟周期。
+mem_fetch_status见mem_fetch_status.tup：
+  MF_TUP_BEGIN( mem_fetch_status )
+    MF_TUP( MEM_FETCH_INITIALIZED ),
+    MF_TUP( IN_L1I_MISS_QUEUE ),
+    MF_TUP( IN_L1D_MISS_QUEUE ),
+    MF_TUP( IN_L1T_MISS_QUEUE ),
+    MF_TUP( IN_L1C_MISS_QUEUE ),
+    MF_TUP( IN_L1TLB_MISS_QUEUE ),
+    MF_TUP( IN_VM_MANAGER_QUEUE ),
+    MF_TUP( IN_ICNT_TO_MEM ),
+    MF_TUP( IN_PARTITION_ROP_DELAY ),
+    MF_TUP( IN_PARTITION_ICNT_TO_L2_QUEUE ),
+    MF_TUP( IN_PARTITION_L2_TO_DRAM_QUEUE ),
+    MF_TUP( IN_PARTITION_DRAM_LATENCY_QUEUE ),
+    MF_TUP( IN_PARTITION_L2_MISS_QUEUE ),
+    MF_TUP( IN_PARTITION_MC_INTERFACE_QUEUE ),
+    MF_TUP( IN_PARTITION_MC_INPUT_QUEUE ),
+    MF_TUP( IN_PARTITION_MC_BANK_ARB_QUEUE ),
+    MF_TUP( IN_PARTITION_DRAM ),
+    MF_TUP( IN_PARTITION_MC_RETURNQ ),
+    MF_TUP( IN_PARTITION_DRAM_TO_L2_QUEUE ),
+    MF_TUP( IN_PARTITION_L2_FILL_QUEUE ),
+    MF_TUP( IN_PARTITION_L2_TO_ICNT_QUEUE ),
+    MF_TUP( IN_ICNT_TO_SHADER ),
+    MF_TUP( IN_CLUSTER_TO_SHADER_QUEUE ),
+    MF_TUP( IN_SHADER_LDST_RESPONSE_FIFO ),
+    MF_TUP( IN_SHADER_FETCHED ),
+    MF_TUP( IN_SHADER_L1T_ROB ),
+    MF_TUP( MEM_FETCH_DELETED ),
+    MF_TUP( NUM_MEM_REQ_STAT )
+  MF_TUP_END( mem_fetch_status )
+*/
 void mem_fetch::set_status(enum mem_fetch_status status,
                            unsigned long long cycle) {
   m_status = status;
@@ -113,6 +147,9 @@ bool mem_fetch::isatomic() const {
   return m_inst.isatomic();
 }
 
+/*
+执行原子操作。
+*/
 void mem_fetch::do_atomic() { m_inst.do_atomic(m_access.get_warp_mask()); }
 
 bool mem_fetch::istexture() const {

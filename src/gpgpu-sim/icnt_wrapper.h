@@ -63,7 +63,14 @@ extern unsigned g_network_mode;
 
 enum network_mode { INTERSIM = 1, LOCAL_XBAR = 2, N_NETWORK_MODE };
 
+/*
+初始化互连网络的配置，指定互连网络的类型以及选择对应的Push/Pop等流程。
+*/
 void icnt_wrapper_init();
+
+/*
+读取互连网络的配置信息。
+*/
 void icnt_reg_options(class OptionParser* opp);
 
 #endif

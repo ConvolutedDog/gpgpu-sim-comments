@@ -3089,6 +3089,8 @@ void cuda_runtime_api::extract_code_using_cuobjdump() {
   // dump ptx for all individial ptx files into sepearte files which is later
   // used by ptxas.
   int result = 0;
+//在4.0的版本中，其实 [dumping by cuobjdump everytime we execute the code] 是必须的，因为它只要是
+//CUDA版本大于6，就会进 extract_ptx_files_using_cuobjdump 重新dump。
 #if (CUDART_VERSION >= 6000)
   extract_ptx_files_using_cuobjdump(context);
   return;

@@ -59,7 +59,11 @@ struct param_t {
 
 using half_float::half;
 
+/*
+PTX指令中的寄存器类。
+*/
 union ptx_reg_t {
+  //构造函数。
   ptx_reg_t() {
     bits.ms = 0;
     bits.ls = 0;
@@ -288,22 +292,68 @@ class ptx_version {
   unsigned m_ptx_extensions;
 };
 
+/*
+时序模拟器（GPGPU-Sim）通过 ptx_thread_info 类与功能模拟器（CUDA-Sim）连接。 m_thread 成员变量是
+SIMT Core类 shader_core_ctx 中 ptx_thread_info 的数组，维护该SIMT Core中所有活动线程的功能状态。
+时序模型通过 warp_inst_t 类与功能模型进行通信， warp_inst_t 类表示一个指令的动态实例，正在由一个
+warp执行。
+
+时序模型在仿真的以下三个阶段与功能模型进行交流：
+1. 解码
+    在 shader_core_ctx::decode() 的解码阶段，时序模拟器从功能模拟器中获得指令，给定一个PC。这是通
+    过调用 ptx_fetch_inst 函数完成的。
+2. 指令执行
+    1)功能执行：时序模型通过调用 ptx_thread_info 类的 ptx_exec_inst 方法将线程的功能状态提前一个
+      指令。这是在 core_t::execute_warp_inst_t 内完成的。时序模拟器传递要执行的指令的动态实例，而
+      功能模型则相应地推进线程的状态。
+    2)SIMT堆栈更新：在功能上执行了一条warp的指令后，时序模型通过向功能模型请求更新SIMT堆栈中的下一
+      个PC。这发生在 simt_stack::update 里面。
+    3)原子回调：如果指令是一个原子操作，那么指令的功能执行就不会在 core_t::execute_warp_inst_t 中
+      发生。相反，在功能执行阶段，功能模拟器通过调用 warp_inst_t::add_callback 在 warp_inst_t 对
+      象中存储一个指向该原子指令的指针。时序模拟器在请求离开二级缓存时执行这个回调函数。
+3. 启动线程块
+    当新的线程块在 shader_core_ctx::issue_block2core 中启动时，时序模拟器通过调用功能模型方法 
+    ptx_sim_init_thread 初始化每个线程的功能状态。此外，时序模型还通过从功能模型中获取起始PC来初始
+    化SIMT堆栈和warp状态。
+
+ptx_thread_info对象包含单个标量线程（OpenCL中的work item）的功能仿真状态。这包括以下内容：
+    a. 寄存器值存储
+    b. 本地内存存储（OpenCL中的私有内存）
+    c. 共享内存存储（OpenCL中的本地内存）。注意，同一线程块/Work Wrap的所有标量线程都
+    d. 会访问相同的共享内存存储。
+    e. 程序计数器（PC）
+    f. 调用堆栈
+    g. 线程ID（网格启动中的软件ID，以及表明它在时序模型中占据哪个硬件线程槽的硬件ID)
+
+在函数仿真中使用的动态数据值的存储使用了不同的寄存器和内存空间类。寄存器的值包含在 ptx_thread_info::
+m_regs 中，这是一个从符号指针到C语言联合体 ptx_reg_t 的映射。寄存器的访问使用方法 ptx_thread_info::
+get_operand_value() ，它使用 operand_info 作为输入。对于内存操作数，该方法返回内存操作数的有效地址。
+编程模型中的每个内存空间都包含在一个类型为 memory_space 的对象中。GPU中所有线程可见的内存空间都包含在 
+gpgpu_t 中，并通过 ptx_thread_info 中的接口进行访问（例如，ptx_thread_info::get_global_memory）。
+*/
 class ptx_thread_info {
  public:
+  //析构函数。
   ~ptx_thread_info();
+  //构造函数。
   ptx_thread_info(kernel_info_t &kernel);
 
   void init(gpgpu_t *gpu, core_t *core, unsigned sid, unsigned cta_id,
             unsigned wid, unsigned tid, bool fsim) {
     m_gpu = gpu;
     m_core = core;
+    //线程所在SM的id。
     m_hw_sid = sid;
+    //线程所在CTA的id。
     m_hw_ctaid = cta_id;
+    //线程所在warp的id。
     m_hw_wid = wid;
+    //线程的id。
     m_hw_tid = tid;
+    //功能模拟。
     m_functionalSimulationMode = fsim;
   }
-
+  //解码阶段，定时模拟器从给定PC的函数模拟器获得指令。这是通过调用ptx_fetch_inst函数完成的。
   void ptx_fetch_inst(inst_t &inst) const;
   void ptx_exec_inst(warp_inst_t &inst, unsigned lane_id);
 

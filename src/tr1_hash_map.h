@@ -29,10 +29,13 @@
 #pragma once
 
 // detection and fallback for unordered_map in C++0x
+//C++0x中 unordered_map（无序Map）的检测和回退
 #ifdef __cplusplus
 // detect GCC 4.3 or later and use unordered map (part of C++0x)
 // unordered map doesn't play nice with _GLIBCXX_DEBUG, just use a map if its
 // enabled.
+//检测GCC 4.3或更高版本，并使用无序映射（C++0x的一部分）
+//无序映射在_GLIBCXX_DEBUG中发挥不好，如果启用了映射，就使用它。
 #if defined(__GNUC__) and not defined(_GLIBCXX_DEBUG)
 #if __GNUC__ >= 4 && __GNUC_MINOR__ >= 3
 #include <unordered_map>

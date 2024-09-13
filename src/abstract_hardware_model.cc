@@ -45,6 +45,8 @@
 
 void mem_access_t::init(gpgpu_context *ctx) {
   gpgpu_ctx = ctx;
+  // gpgpu_ctx->sm_next_access_uid是一个全局变量，用于记录下一个访存的唯一标识符，每新创建一个内存访问
+  // 对象，这个全局变量自增1。
   m_uid = ++(gpgpu_ctx->sm_next_access_uid);
   m_addr = 0;
   m_req_size = 0;
@@ -210,6 +212,12 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   gpu_tot_sim_cycle = 0;
 }
 
+/*
+地址 address 将 line_size-1 个低位置 0 后的地址。或者理解为所在的 word 的地址。
+比如地址为 'b11011，line_size = word_size = 4 字节 = 'b00100，~(line_size-1) = 'b11100，
+address & ~(line_size-1) = 'b11011 & 'b11100 = 'b11000。返回地址 address 所在的那个字的
+首个字节数据的地址。
+*/
 new_addr_type line_size_based_tag_func(new_addr_type address,
                                        new_addr_type line_size) {
   // gives the tag for an address based on a given line size
@@ -260,6 +268,7 @@ void warp_inst_t::do_atomic(bool forceDo) {
   do_atomic(m_warp_active_mask, forceDo);
 }
 
+// 执行原子操作。
 void warp_inst_t::do_atomic(const active_mask_t &access_mask, bool forceDo) {
   assert(m_isatomic && (!m_empty || forceDo));
   if (!should_do_atomic) return;
@@ -274,6 +283,7 @@ void warp_inst_t::do_atomic(const active_mask_t &access_mask, bool forceDo) {
 void warp_inst_t::broadcast_barrier_reduction(
     const active_mask_t &access_mask) {
   for (unsigned i = 0; i < m_config->warp_size; i++) {
+    //函数 std::bitset_name.test(index) 用于测试第 index 位是否被设置，返回True/False。 
     if (access_mask.test(i)) {
       dram_callback_t &cb = m_per_scalar_thread[i].callback;
       if (cb.thread) {
@@ -283,13 +293,30 @@ void warp_inst_t::broadcast_barrier_reduction(
   }
 }
 
+/*
+生成 warp 指令的内存访问的必要信息。
+在性能模型 shader_core_ctx::issue_warp 函数执行时，即指令确定能发射时，调用指令的功能执行函
+数对指令进行功能模拟。功能模拟的过程中，如果指令是load或store指令，则生成内存访
+问的必要的信息，例如：设置 access_type，计算一个 warp 指令对 shared memory 访存的执行
+周期等。
+*/
 void warp_inst_t::generate_mem_accesses() {
+  // 如果 warp_inst_t 内的指令为空，或者指令非空但操作码为存储屏障，或者该指令的访存操作已经
+  // 生成，则中断执行当前函数生成访存操作的必要信息。
   if (empty() || op == MEMORY_BARRIER_OP || m_mem_accesses_created) return;
+  // 访存操作仅存在于 LOAD_OP、TENSOR_CORE_LOAD_OP、STORE_OP、TENSOR_CORE_STORE_OP，非这
+  // 些指令都中断当前函数执行。
   if (!((op == LOAD_OP) || (op == TENSOR_CORE_LOAD_OP) || (op == STORE_OP) ||
         (op == TENSOR_CORE_STORE_OP)))
     return;
+  // m_warp_active_mask 是一个 std::bitset 对象，其计数为零，说明没有一个线程是活跃的。可
+  // 能是 PTX 指令的谓词为 false 将一整个 warp 的线程置为全部不需要执行这条指令了。
   if (m_warp_active_mask.count() == 0) return;  // predicated off
-
+  // m_accessq 在 abstract_hardware_model.h 中定义：
+  //    std::list<mem_access_t> m_accessq;
+  // 是一个[访存操作]的列表。是每个 warp 指令对象中都有的访存行为的列表。
+  // starting_queue_size 用于记录在生成访存操作的必要信息之前，m_accessq 在该起始状态下的
+  // 大小。
   const size_t starting_queue_size = m_accessq.size();
 
   assert(is_load() || is_store());
@@ -297,27 +324,109 @@ void warp_inst_t::generate_mem_accesses() {
   // if((space.get_type() != tex_space) && (space.get_type() != const_space))
   assert(m_per_scalar_thread_valid);  // need address information per thread
 
-  bool is_write = is_store();
+  // 分别根据 access_type（访存类型）生成对应的访存行为的必要信息之前，特别是 param memory 
+  // 的访存实现是定义在了其他函数中：
+  //    memory_coalescing_arch[_atomic](is_write, access_type);
+  // 为了方便，把 is_write 和 access_type 作为参数传递给 memory_coalescing_arch[_atomic]，
+  // 即需要提前获取一下。
 
+  // 访存为写操作标志。
+  bool is_write = is_store();
+  // access_type：访存类型。
+  // mem_access_type 定义了在时序模拟器中对不同类型的存储器进行不同的访存类型：
+  //    MA_TUP(GLOBAL_ACC_R), 从 global memory 读
+  //    MA_TUP(LOCAL_ACC_R), 从 local memory 读
+  //    MA_TUP(CONST_ACC_R), 从常量缓存读
+  //    MA_TUP(TEXTURE_ACC_R), 从纹理缓存读
+  //    MA_TUP(GLOBAL_ACC_W), 向 global memory 写
+  //    MA_TUP(LOCAL_ACC_W), 向 local memory 写
+  // 在 V100 中，L1 cache 的 m_write_policy 为WRITE_THROUGH，实际上 L1_WRBK_ACC 也不会
+  // 用到：
+  //    MA_TUP(L1_WRBK_ACC), L1缓存write back
+  // 在 V100 中，当 L2 cache 写不命中时，采取 lazy_fetch_on_read 策略，当找到一个 cache 
+  // block 逐出时，如果这个 cache block 是被 MODIFIED，则需要将这个 cache block 写回到下
+  // 一级存储，因此会产生 L2_WRBK_ACC 访问，这个访问就是为了写回被逐出的 MODIFIED cache 
+  // block。
+  //    MA_TUP(L2_WRBK_ACC), L2 缓存 write back
+  //    MA_TUP(INST_ACC_R), 从指令缓存读
+  // L1_WR_ALLOC_R / L2_WR_ALLOC_R 在 V100 配置中暂时用不到：
+  //    MA_TUP(L1_WR_ALLOC_R), L1 缓存 write-allocate（对 cache 写不命中，将主存中块调入 
+  //                           cache，写入该 cache 块）
+  // L1_WR_ALLOC_R / L2_WR_ALLOC_R 在 V100 配置中暂时用不到：
+  //    MA_TUP(L2_WR_ALLOC_R), L2 缓存 write-allocate
   mem_access_type access_type;
+  // space 是存储空间的类型，包括：
+  //    1. 未定义的空间类型
+  //    undefined_space = 0,
+  //    2. 寄存器
+  //    reg_space,
+  //    3. local memory
+  //    local_space,
+  //    4. shared memory
+  //    shared_space,
+  //    5. 貌似是 shared static array，其访存的行为与 shared memory 一致，可以认为其是 
+  //       shared memory 的一种
+  //    sstarr_space,
+  //    6. 通用参数存储
+  //    param_space_unclassified,
+  //    7. 对内核中的所有线程：全局性的，只读的
+  //    param_space_kernel, // global to all threads in a kernel : read-only
+  //    8. 对某个线程：私有的，可读写的
+  //    param_space_local,  // local to a thread : read-writable
+  //    9. 常量缓存
+  //    const_space,
+  //    10.纹理缓存
+  //    tex_space,
+  //    11.渲染曲面 // render surfaces 
+  //    surf_space,
+  //    12.global memory
+  //    global_space,
+  //    13.通用存储
+  //    generic_space,
+  //    14.指令存储
+  //    instruction_space
+  // ===================================================================
+  // mem_access_type 定义了在时序模拟器中对不同类型的存储器进行不同的访存类型：
+  //    MA_TUP(GLOBAL_ACC_R), 从 global memory 读
+  //    MA_TUP(LOCAL_ACC_R), 从 local memory 读
+  //    MA_TUP(CONST_ACC_R), 从常量缓存读
+  //    MA_TUP(TEXTURE_ACC_R), 从纹理缓存读
+  //    MA_TUP(GLOBAL_ACC_W), 向 global memory 写
+  //    MA_TUP(LOCAL_ACC_W), 向 local memory 写
+  // 在 V100 中，L1 cache 的 m_write_policy 为WRITE_THROUGH，实际上 L1_WRBK_ACC 也不会
+  // 用到：
+  //    MA_TUP(L1_WRBK_ACC), L1缓存write back
+  // 在 V100 中，当 L2 cache 写不命中时，采取 lazy_fetch_on_read 策略，当找到一个 cache 
+  // block 逐出时，如果这个 cache block 是被 MODIFIED，则需要将这个 cache block 写回到下
+  // 一级存储，因此会产生 L2_WRBK_ACC 访问，这个访问就是为了写回被逐出的 MODIFIED cache 
+  // block。
+  //    MA_TUP(L2_WRBK_ACC), L2 缓存 write back
+  //    MA_TUP(INST_ACC_R), 从指令缓存读
+  // L1_WR_ALLOC_R / L2_WR_ALLOC_R 在 V100 配置中暂时用不到：
+  //    MA_TUP(L1_WR_ALLOC_R), L1 缓存 write-allocate（对 cache 写不命中，将主存中块调入 
+  //                           cache，写入该 cache 块）
+  // L1_WR_ALLOC_R / L2_WR_ALLOC_R 在 V100 配置中暂时用不到：
+  //    MA_TUP(L2_WR_ALLOC_R), L2 缓存 write-allocate
   switch (space.get_type()) {
-    case const_space:
-    case param_space_kernel:
-      access_type = CONST_ACC_R;
+    case const_space:        // 常量缓存
+    case param_space_kernel: // 对内核中所有线程：全局性的，只读的（参数一般放在常量缓存）
+      access_type = CONST_ACC_R; // ==> 从常量缓存读
       break;
-    case tex_space:
-      access_type = TEXTURE_ACC_R;
+    case tex_space: // 纹理缓存
+      access_type = TEXTURE_ACC_R; // ==> 从纹理缓存读
       break;
-    case global_space:
-      access_type = is_write ? GLOBAL_ACC_W : GLOBAL_ACC_R;
+    case global_space: // global memory
+      access_type = is_write ? GLOBAL_ACC_W : GLOBAL_ACC_R; // ==> 向全局存储写/从全局
+                                                            //     存储读
       break;
-    case local_space:
-    case param_space_local:
-      access_type = is_write ? LOCAL_ACC_W : LOCAL_ACC_R;
+    case local_space: // local memory
+    case param_space_local: // local param memory
+      access_type = is_write ? LOCAL_ACC_W : LOCAL_ACC_R; // ==> 向局部存储写/从局部存
+                                                          //     储读
       break;
-    case shared_space:
+    case shared_space: // shared memory
       break;
-    case sstarr_space:
+    case sstarr_space: // 可以认为其是 shared memory 的一种
       break;
     default:
       assert(0);
@@ -325,83 +434,172 @@ void warp_inst_t::generate_mem_accesses() {
   }
 
   // Calculate memory accesses generated by this warp
+  // 用于计算此 warp 产生的内存访问数据大小。new_addr_type 定义：
+  //    typedef unsigned long long new_addr_type;
   new_addr_type cache_block_size = 0;  // in bytes
-
+  //生成访存操作。
   switch (space.get_type()) {
-    case shared_space:
-    case sstarr_space: {
+    case shared_space:   // shared memory 访存操作
+    case sstarr_space: { // 类似 shared memory 访存操作，可能是 shared static array，
+                         // 可能与 Tensor Core 有关。
+      // m_config->mem_warp_parts: Number of portions a warp is divided into for 
+      // shared memory bank conflict check.
+      // m_config->mem_warp_parts：是共享存储冲突检查将warp划分为的部分数（Number of 
+      // portions a warp is divided into for shared memory bank conflict check）。
+      // subwarp_size 是单个部分的线程数量。
+      // 在 V100 配置下，m_config->mem_warp_parts = 1。  
       unsigned subwarp_size = m_config->warp_size / m_config->mem_warp_parts;
+      // 总的最大 bank 访问数。对每个 subwarp 的最大 bank 访问数进行累加。
       unsigned total_accesses = 0;
+      // 对一个 warp 划分为的所有部分遍历。
       for (unsigned subwarp = 0; subwarp < m_config->mem_warp_parts;
            subwarp++) {
         // data structures used per part warp
+        // 每个 warp part 使用的数据结构：映射关系为 bank -> word address -> access count。
         std::map<unsigned, std::map<new_addr_type, unsigned> >
             bank_accs;  // bank -> word address -> access count
 
         // step 1: compute accesses to words in banks
+        // 步骤 1：计算对 bank 中字大小数据的访问量。
+        // 对当前 subwarp 中的所有线程遍历。
         for (unsigned thread = subwarp * subwarp_size;
              thread < (subwarp + 1) * subwarp_size; thread++) {
+          // 如果该线程非活跃，则跳出线程循环，转到下个线程。
           if (!active(thread)) continue;
+          // m_per_scalar_thread 定义：
+          //    std::vector<per_thread_info> m_per_scalar_thread;
           new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
           // FIXME: deferred allocation of shared memory should not accumulate
           // across kernel launches assert( addr < m_config->gpgpu_shmem_size );
+          // shmem_bank_func(...)：根据数据地址，判断其位于哪一个 shared memory 的 Bank。
+          // 根据数据地址，判断其位于哪一个 shared memory 的 Bank。
+          // static const address_type WORD_SIZE = 4;
+          // unsigned shmem_bank_func(address_type addr) const {
+          //   return ((addr / WORD_SIZE) % num_shmem_bank);
+          // }
+          // 每个 word 的大小为 4 字节，每 4 字节一个 bank。
           unsigned bank = m_config->shmem_bank_func(addr);
+          // 返回地址 address 将 line_size-1 个低位置 0 后的地址。亦即地址 address 所在的
+          // 那个字的首个字节数据的地址。或者理解为所在的 word 的地址。
+          //   return addr & ~(m_config->WORD_SIZE - 1);
           new_addr_type word =
               line_size_based_tag_func(addr, m_config->WORD_SIZE);
+          // 对第 bank 个 bank，以 word 为起始地址的数据访存。该地址的 bank_accs 增加 1。
+          // bank_accs 是一个三维的 map：
+          // index1 是 bank 号，index1 指向的是 std::map<new_addr_type, unsigned> 的值。
+          // 该 map 的 index2 是 new_addr_type 的地址，实际保存的是 address 所在的那个字
+          // 的地址，然后这个地址指向的 value 是[访存的次数]。
           bank_accs[bank][word]++;
         }
-
+        // Limit shared memory to do one broadcast per cycle (default on).
+        // 将共享内存限制为每个周期执行一次广播（默认设置为打开）。但是在 V100 配置下，该值
+        // 为 false。这里其实是一个 subwarp 中的所有线程的访问，有可能存在多个线程访问同一
+        // 个 bank 的同一个 word 的情况，这时候为了避免需要分多拍对该 bank 访问，共享存储
+        // 可以进行广播，但是这里的限制是每个周期只执行一次广播，即每次只能广播一个 bank 的
+        // 一个 word。下面就是检测是否有广播的情况，满足广播的情况是，某 bank 的某个 word
+        // 被访问的次数大于 1，就说明至少两个线程访问了这个 bank 的同一个 word。
         if (m_config->shmem_limited_broadcast) {
           // step 2: look for and select a broadcast bank/word if one occurs
+          // 步骤 2：查找并选择广播 Bank/Word，即查找 bank_accs[bank][word] 中有广播的两
+          // 层索引。有广播即为：bank_accs[bank][word] 指向的 [访存的次数] > 1。
+          // broadcast_detected 代表是否检测到广播数据的地址的标志。
           bool broadcast_detected = false;
+          // bank_accs[bank][word] 中广播数据地址的 index2。
           new_addr_type broadcast_word = (new_addr_type)-1;
+          // bank_accs[bank][word] 中广播数据地址的 index1。
           unsigned broadcast_bank = (unsigned)-1;
           std::map<unsigned, std::map<new_addr_type, unsigned> >::iterator b;
           for (b = bank_accs.begin(); b != bank_accs.end(); b++) {
+            // b->first = bank_accs[bank][word] 中广播数据的 index1，bank号。
             unsigned bank = b->first;
             std::map<new_addr_type, unsigned> &access_set = b->second;
             std::map<new_addr_type, unsigned>::iterator w;
             for (w = access_set.begin(); w != access_set.end(); ++w) {
+              // w->second = bank_accs[bank][word] 指向的[访存的次数]。
               if (w->second > 1) {
                 // found a broadcast
+                // 找到一个广播地址。
+                // 设置已经检测到广播数据的地址的标志为 True。
                 broadcast_detected = true;
+                // 设置已经检测到广播数据的 bank 号。
                 broadcast_bank = bank;
+                // 设置已经检测到广播数据的地址。
                 broadcast_word = w->first;
+                // 找到一个广播的地址后，跳出该层循环。
                 break;
               }
             }
+            // shmem_limited_broadcast 将共享内存限制为每个周期执行一次广播，因此找到一个
+            // 可广播后即跳出循环。
             if (broadcast_detected) break;
           }
 
+          // 这里已经找到了需要被广播的 bank 号和广播的地址，需要计算当前拍，对一个 bank 访
+          // 问的最大值，这个最大值很重要，因为最大值就是当前这个 shared memory 访存指令需
+          // 要执行的周期数，后面的代码会将这个周期数作为指令的 initial interval，用以模拟
+          // 对 shared memory 访问的流水线执行延迟。 
+
           // step 3: figure out max bank accesses performed, taking account of
           // broadcast case
+          // 步骤 3：考虑广播情况，计算执行的最大 Bank 访问数（max_bank_accesses）。就是比
+          // 如有 3 个 Bank，第 1 个 Bank 访存 3 次，第 2 个 Bank 访存 4 次，第 3 个 Bank 
+          // 访存 5 次。最大 Bank 访问数 max_bank_accesses = 5。
+          // 例如，bank_accs 的内容为：
+          //    bank_accs[0] = map<new_addr_type, 3> = [<'b01, 3>]
+          //    bank_accs[1] = map<new_addr_type, 4> = [<'b05, 4>]
+          //    bank_accs[2] = map<new_addr_type, 5> = [<'b10, 5>]
           unsigned max_bank_accesses = 0;
+          // bank_accs 是一个三维的 map：
+          // index1 是 bank 号，index1 指向的是 std::map<new_addr_type, unsigned> 的值。
+          // 该 map 的 index2 是 new_addr_type 的地址，实际保存的是 address 所在的那个字
+          // 的地址，然后这个地址指向的 value 是[访存的次数]。
           for (b = bank_accs.begin(); b != bank_accs.end(); b++) {
+            // 当前 bank 总共被访存的次数。
             unsigned bank_accesses = 0;
             std::map<new_addr_type, unsigned> &access_set = b->second;
             std::map<new_addr_type, unsigned>::iterator w;
+            // 计算当前 bank 总共被访存的次数 bank_accesses。
             for (w = access_set.begin(); w != access_set.end(); ++w)
               bank_accesses += w->second;
+            // 需广播的 bank 号是 broadcast_bank，该 bank 里的广播地址为 broadcast_word。
             if (broadcast_detected && broadcast_bank == b->first) {
               for (w = access_set.begin(); w != access_set.end(); ++w) {
                 if (w->first == broadcast_word) {
                   unsigned n = w->second;
+                  // 因为检测到需要广播的条件就是 w->second > 1，因此这里 assertion 一下。
+                  // 若不满足，则说明这个广播的 bank 里的广播地址的访存次数不大于 1，这是与
+                  // 前面检测逻辑不符了。
                   assert(n > 1);  // or this wasn't a broadcast
+                  // 同上。
                   assert(bank_accesses >= (n - 1));
+                  // 因为选定的当前 bank 的 word 作为广播地址，经过广播后（这里限制广播每拍
+                  // 只能广播一个 bank 的 一个 word），因此该 bank 访存次数 bank_accesses
+                  // 前面的计算是按照没有广播计算的，这里需要考虑广播进去，广播将 n 次对当前
+                  // bank 的访存直接减小到 1，对于该 bank 的总访存次数来说，就是减去 n - 1。
                   bank_accesses -= (n - 1);
                   break;
                 }
               }
             }
+            // max_bank_accesses 就是取 bank_accs 里的所有 index1 指向的 map<new_addr_
+            // type, unsigned> 的访存次数的最大值。
+            // 如果当前 bank 的访问次数（考虑了广播），大于最大的 bank 访问次数，则更新最大
+            // bank 访问次数。这个最大值很重要，因为最大值就是当前这个 shared memory 访存指
+            // 令需要执行的周期数，后面的代码会将这个周期数作为指令的 initial interval，用
+            // 以模拟对 shared memory 访问的流水线执行延迟。
             if (bank_accesses > max_bank_accesses)
               max_bank_accesses = bank_accesses;
           }
 
           // step 4: accumulate
+          // 步骤 4：总的最大 bank 访问数累加。对每个 subwarp 的最大 bank 访问数进行累加。
           total_accesses += max_bank_accesses;
         } else {
+          // 不将共享内存限制为每个周期执行一次广播。即可以无限执行广播，可以在一周期内执行所
+          // bank 的所有的 word 的广播。
           // step 2: look for the bank with the maximum number of access to
           // different words
+          // 步骤 2：查找访问不同 word 字访问最多的 Bank。
           unsigned max_bank_accesses = 0;
           std::map<unsigned, std::map<new_addr_type, unsigned> >::iterator b;
           for (b = bank_accs.begin(); b != bank_accs.end(); b++) {
@@ -410,10 +608,25 @@ void warp_inst_t::generate_mem_accesses() {
           }
 
           // step 3: accumulate
+          // 步骤 3：总的最大 bank 访问数累加。对每个 subwarp 的最大 bank 访问数进行累加。
           total_accesses += max_bank_accesses;
         }
       }
       assert(total_accesses > 0 && total_accesses <= m_config->warp_size);
+      // 共享内存的访存时间消耗模型，建模为每次访存的最大的对某个 bank 的访存数（每次访存一
+      // 个周期），因此上面计算了每个 subwarp 的最大 bank 访问数（max_bank_accesses）。前
+      // 面求 max_bank_accesses 时，是求每个 bank 里的对第 0 号、第 1 号、... bank 访存
+      // 次数的最大值，因此这里的 total_accesses 就是所有的 subwarp 累加起来的对第 0 号、
+      // 第 1 号、... bank 访存次数的最大值。由于当前指令是一个 load 或者 store 指令，因此
+      // 它的访存时间消耗为访问 bank 的最大次数 total_accesses。这里是传给性能模型的访存时
+      // 间消耗时钟周期数。
+      // 对于一般的指令，其 initial interval 是由其指令操作码定义的。但是对 shared memory
+      // 访存指令来说，其 initial interval 是由对某个 bank 的访存总数（每次访存一个周期）
+      // 定义的。
+      // 请注意的是这里所说的访存时间消耗时钟周期数是指 shared memory 对于多 bank 访存必须
+      // 分 bank 访问的时间消耗，而不是一条指令访问 shared memory 的总时间消耗。后者还需要
+      // 加上 shared memory 的访存延迟，这个延迟是由 gpgpu_l1_latency 配置参数决定的，这个
+      // 固有延迟在执行流水线模型的 m_pipeline_reg 中模拟。
       cycles = total_accesses;  // shared memory conflicts modeled as larger
                                 // initiation interval
       m_config->gpgpu_ctx->stats->ptx_file_line_stats_add_smem_bank_conflict(
@@ -421,17 +634,21 @@ void warp_inst_t::generate_mem_accesses() {
       break;
     }
 
-    case tex_space:
+    case tex_space: // 纹理缓存访存操作
+      // gpgpu_cache_texl1_linesize：纹理缓存线大小（用于确定内存访问次数）。
       cache_block_size = m_config->gpgpu_cache_texl1_linesize;
       break;
-    case const_space:
-    case param_space_kernel:
+    case const_space:        // 常量缓存访存操作
+    case param_space_kernel: // 参数空间访存操作（对内核中的所有线程是全局性、只读的（参数
+                             // 一般放在常量缓存））
+      // gpgpu_cache_constl1_linesize：常量缓存线大小（用于确定内存访问次数）。
       cache_block_size = m_config->gpgpu_cache_constl1_linesize;
       break;
 
-    case global_space:
-    case local_space:
-    case param_space_local:
+    case global_space:      // global memory 访存操作
+    case local_space:       // local memory 访存操作
+    case param_space_local: // local param memory 访存操作
+      // gpgpu_coalesce_arch：片外存储器请求架构参数。V100 GPU = 60。
       if (m_config->gpgpu_coalesce_arch >= 13) {
         if (isatomic())
           memory_coalescing_arch_atomic(is_write, access_type);
@@ -446,23 +663,60 @@ void warp_inst_t::generate_mem_accesses() {
       abort();
   }
 
+  // 仅有对 tex_space、const_space、param_space_kernel 才会执行到这里。
+  // 对于 tex_space，cache_block_size 是 gpgpu_cache_texl1_linesize；对于 const_space 
+  // 和 param_space_kernel，cache_block_size 是 gpgpu_cache_constl1_linesize。
   if (cache_block_size) {
+    // m_accessq 在 abstract_hardware_model.h 中定义：
+    //    std::list<mem_access_t> m_accessq;
+    // 是一个[访存操作]的列表。
     assert(m_accessq.empty());
     mem_access_byte_mask_t byte_mask;
+    // accesses 表示当前 warp 中有哪些线程访问 new_addr_type 类型的 cache block 的地址。
     std::map<new_addr_type, active_mask_t>
         accesses;  // block address -> set of thread offsets in warp
     std::map<new_addr_type, active_mask_t>::iterator a;
     for (unsigned thread = 0; thread < m_config->warp_size; thread++) {
       if (!active(thread)) continue;
       new_addr_type addr = m_per_scalar_thread[thread].memreqaddr[0];
+      // 计算访问当前 cache 的 block 的地址。
       new_addr_type block_address =
           line_size_based_tag_func(addr, cache_block_size);
+      // accesses 是一个映射关系：block address -> set of thread offsets in warp。这里
+      // 将第 thread 个位置为 1，表示该线程访问了当前 block 的 address。
       accesses[block_address].set(thread);
+      // 下面的代码是为单次访存的字节数据标识符 byte_mask 赋值，访存的每 byte 对应其中的一
+      // 位，byte_mask 定义为：
+      //     const unsigned MAX_MEMORY_ACCESS_SIZE = 128; // 每次访存最大字节数为 128。
+      //     typedef std::bitset<MAX_MEMORY_ACCESS_SIZE> mem_access_byte_mask_t;
+      // 这里的 idx 代表从 block_address 开始，要访问的字节的起始偏移量，终止偏移量为 idx 
+      // + data_size。data_size 是在 cuda-sim.cc 中依据访存指令的后缀符（.b8/.s8/.f32等）
+      // 确定的（依次确定为 1/1/4 字节）。
       unsigned idx = addr - block_address;
       for (unsigned i = 0; i < data_size; i++) byte_mask.set(idx + i);
     }
+    // 将 accesses 中的数据转移到 m_accessq 中。accesses 是一个映射关系：block address 
+    // -> set of thread offsets in warp。这里将第 thread 个位置为 1，表示该线程访问了当
+    // 前 block 的 address。
     for (a = accesses.begin(); a != accesses.end(); ++a)
       m_accessq.push_back(mem_access_t(
+          // access_type: 
+          //   case tex_space: // 纹理缓存
+          //       access_type = TEXTURE_ACC_R; // ==> 从纹理缓存读
+          //   case const_space:        // 常量缓存
+          //   case param_space_kernel: // 对内核中所有线程：全局性的，只读的（参数一般
+          //                            // 放在常量缓存）
+          //       access_type = CONST_ACC_R; // ==> 从常量缓存读
+          // a->first 是 block address。
+          // 对于 tex_space，cache_block_size 是 texl1_linesize；
+          // 对于 const_space 和 param_space_kernel，cache_block_size 是 constl1_linesize。
+          // is_write = warp_inst_t::is_store()。
+          // a->second 是 active_mask_t，表示当前 warp 中有哪些线程访问 new_addr_type 
+          // 类型的 cache block 的地址。
+          // byte_mask 是 mem_access_byte_mask_t，表示访存的每 byte 对应其中的一位。
+          // mem_access_sector_mask_t() 是 mem_access_sector_mask_t 类型的空对象。即全
+          // 部为 0。
+          // m_config->gpgpu_ctx 是 gpgpu_sim_ctx 的指针。
           access_type, a->first, cache_block_size, is_write, a->second,
           byte_mask, mem_access_sector_mask_t(), m_config->gpgpu_ctx));
   }
@@ -471,6 +725,7 @@ void warp_inst_t::generate_mem_accesses() {
     m_config->gpgpu_ctx->stats->ptx_file_line_stats_add_uncoalesced_gmem(
         pc, m_accessq.size() - starting_queue_size);
   }
+  // 设置 m_mem_accesses_created 为 true，避免重复创建访存操作。
   m_mem_accesses_created = true;
 }
 
@@ -478,6 +733,8 @@ void warp_inst_t::memory_coalescing_arch(bool is_write,
                                          mem_access_type access_type) {
   // see the CUDA manual where it discusses coalescing rules before reading this
   unsigned segment_size = 0;
+  // m_config->mem_warp_parts: Number of portions a warp is divided into for 
+  // shared memory bank conflict check.
   unsigned warp_parts = m_config->mem_warp_parts;
   bool sector_segment_size = false;
 
@@ -594,6 +851,8 @@ void warp_inst_t::memory_coalescing_arch_atomic(bool is_write,
 
   // see the CUDA manual where it discusses coalescing rules before reading this
   unsigned segment_size = 0;
+  // m_config->mem_warp_parts: Number of portions a warp is divided into for 
+  // shared memory bank conflict check.
   unsigned warp_parts = m_config->mem_warp_parts;
   bool sector_segment_size = false;
 
@@ -756,17 +1015,28 @@ void warp_inst_t::completed(unsigned long long cycle) const {
       pc, latency * active_count());
 }
 
+/*
+kernel_info_t构造函数。
+*/
 kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
                              class function_info *entry,
                              unsigned long long streamID) {
+  //kernel的入口函数。
   m_kernel_entry = entry;
+  //Grid维度。
   m_grid_dim = gridDim;
+  //Block维度。
   m_block_dim = blockDim;
+  //下一个要加载的CTA的index.x。
   m_next_cta.x = 0;
+  //下一个要加载的CTA的index.y。
   m_next_cta.y = 0;
+  //下一个要加载的CTA的index.z。
   m_next_cta.z = 0;
   m_next_tid = m_next_cta;
+  //正在执行当前kernel的SIMT Core的数量。
   m_num_cores_running = 0;
+  //当前kernel的唯一标识符。
   m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
   m_streamID = streamID;
   m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
@@ -777,6 +1047,8 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
   // Jin: launch latency management
   m_launch_latency = entry->gpgpu_ctx->device_runtime->g_kernel_launch_latency;
 
+  //g_kernel_launch_latency: Kernel launch latency in cycles, 5000 (V100)
+  //g_TB_launch_latency: Thread block launch latency in cycles, 0 (V100)
   m_kernel_TB_latency =
       entry->gpgpu_ctx->device_runtime->g_kernel_launch_latency +
       num_blocks() * entry->gpgpu_ctx->device_runtime->g_TB_launch_latency;
@@ -787,19 +1059,30 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
 /*A snapshot of the texture mappings needs to be stored in the kernel's info as
 kernels should use the texture bindings seen at the time of launch and textures
  can be bound/unbound asynchronously with respect to streams. */
+// 纹理映射的快照需要存储在内核的信息中，因为内核应该使用启动时看到的纹理绑定，并且纹理可以相对于流异步
+// 绑定/解除绑定。
 kernel_info_t::kernel_info_t(
     dim3 gridDim, dim3 blockDim, class function_info *entry,
     std::map<std::string, const struct cudaArray *> nameToCudaArray,
     std::map<std::string, const struct textureInfo *> nameToTextureInfo) {
+  //kernel的入口函数。
   m_kernel_entry = entry;
+  //Grid维度。
   m_grid_dim = gridDim;
+  //Block维度。
   m_block_dim = blockDim;
+  //下一个要加载的CTA的index.x。
   m_next_cta.x = 0;
+  //下一个要加载的CTA的index.y。
   m_next_cta.y = 0;
+  //下一个要加载的CTA的index.z。
   m_next_cta.z = 0;
   m_next_tid = m_next_cta;
+  //正在执行当前kernel的SIMT Core的数量。
   m_num_cores_running = 0;
+  //当前kernel的唯一标识符。
   m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
+  //初始化当前kernel的参数内存空间。
   m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
 
   // Jin: parent and child kernel management for CDP
@@ -817,12 +1100,18 @@ kernel_info_t::kernel_info_t(
   m_NameToTextureInfo = nameToTextureInfo;
 }
 
+/*
+kernel_info_t的析构函数。
+*/
 kernel_info_t::~kernel_info_t() {
   assert(m_active_threads.empty());
   destroy_cta_streams();
   delete m_param_mem;
 }
 
+/*
+返回当前 kernel_info_t 内核对象的内核名。
+*/
 std::string kernel_info_t::name() const { return m_kernel_entry->get_name(); }
 
 // Jin: parent and child kernel management for CDP
@@ -927,6 +1216,12 @@ void kernel_info_t::destroy_cta_streams() {
   m_cta_streams.clear();
 }
 
+/*
+SIMT 堆栈类的构造函数。每个SIMT Core中，都有可配置数量的调度器单元。对于每个调度器单元，有一个SIMT
+堆栈阵列。每个SIMT堆栈对应一个warp。传入的参数是：
+    unsigned wid：warp的ID；
+    unsigned warpSize：单个warp内的线程数量。
+*/
 simt_stack::simt_stack(unsigned wid, unsigned warpSize, class gpgpu_sim *gpu) {
   m_warp_id = wid;
   m_warp_size = warpSize;
@@ -934,18 +1229,34 @@ simt_stack::simt_stack(unsigned wid, unsigned warpSize, class gpgpu_sim *gpu) {
   reset();
 }
 
+/*
+m_stack定义为：
+    std::deque<simt_stack_entry> m_stack;
+清空m_stack里的所有条目。
+*/
 void simt_stack::reset() { m_stack.clear(); }
 
+/*
+功能模拟过程中，用warp的起始PC值（用该warp的首个线程m_thread[warpId * m_warp_size]->get_pc()获
+取）线程和其线程掩码用于启动SIMT堆栈。
+*/
 void simt_stack::launch(address_type start_pc, const simt_mask_t &active_mask) {
+  //清空m_stack里的所有条目。
   reset();
+  //新建SIMT堆栈里的首个条目。
   simt_stack_entry new_stack_entry;
+  //设置PC值、线程掩码等信息。
   new_stack_entry.m_pc = start_pc;
   new_stack_entry.m_calldepth = 1;
   new_stack_entry.m_active_mask = active_mask;
   new_stack_entry.m_type = STACK_ENTRY_TYPE_NORMAL;
+  //把创建好的首个条目压入m_stack队列。
   m_stack.push_back(new_stack_entry);
 }
 
+/*
+暂时用不到，以后用到再补充。
+*/
 void simt_stack::resume(char *fname) {
   reset();
 
@@ -984,22 +1295,34 @@ void simt_stack::resume(char *fname) {
   fclose(fp2);
 }
 
+/*
+返回m_stack队列最末尾加入条目的线程掩码。[最末尾加入条目]即为栈顶top。
+*/
 const simt_mask_t &simt_stack::get_active_mask() const {
   assert(m_stack.size() > 0);
   return m_stack.back().m_active_mask;
 }
 
+/*
+返回m_stack队列最末尾加入条目的PC值和RPC值。[最末尾加入条目]即为栈顶top。
+*/
 void simt_stack::get_pdom_stack_top_info(unsigned *pc, unsigned *rpc) const {
   assert(m_stack.size() > 0);
   *pc = m_stack.back().m_pc;
   *rpc = m_stack.back().m_recvg_pc;
 }
 
+/*
+返回m_stack队列最末尾加入条目的RPC值。[最末尾加入条目]即为栈顶top。
+*/
 unsigned simt_stack::get_rp() const {
   assert(m_stack.size() > 0);
   return m_stack.back().m_recvg_pc;
 }
 
+/*
+打印SIMT堆栈的每个条目。
+*/
 void simt_stack::print(FILE *fout) const {
   for (unsigned k = 0; k < m_stack.size(); k++) {
     simt_stack_entry stack_entry = m_stack[k];
@@ -1030,6 +1353,9 @@ void simt_stack::print(FILE *fout) const {
   }
 }
 
+/*
+打印SIMT堆栈的check point。
+*/
 void simt_stack::print_checkpoint(FILE *fout) const {
   for (unsigned k = 0; k < m_stack.size(); k++) {
     simt_stack_entry stack_entry = m_stack[k];
@@ -1043,18 +1369,26 @@ void simt_stack::print_checkpoint(FILE *fout) const {
   }
 }
 
+/*
+更新SIMT堆栈的状态。最好先将激活线程最多的条目放进栈，然后将激活线程较少的条目放入栈。
+*/
 void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
                         address_type recvg_pc, op_type next_inst_op,
                         unsigned next_inst_size, address_type next_inst_pc) {
   assert(m_stack.size() > 0);
-
+  //next_pc是一个地址向量，addr_vector_t定义为：
+  //    typedef std::vector<address_type> addr_vector_t;
   assert(next_pc.size() == m_warp_size);
-
+  //栈顶活跃线程掩码。
   simt_mask_t top_active_mask = m_stack.back().m_active_mask;
+  //栈顶RPC。
   address_type top_recvg_pc = m_stack.back().m_recvg_pc;
+  //栈顶NPC。
   address_type top_pc =
       m_stack.back().m_pc;  // the pc of the instruction just executed
+  //栈顶堆栈条目的类型。
   stack_entry_type top_type = m_stack.back().m_type;
+  //栈顶NPC === next_inst_pc。
   assert(top_pc == next_inst_pc);
   assert(top_active_mask.any());
 
@@ -1062,39 +1396,197 @@ void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
   bool warp_diverged = false;
   address_type new_recvg_pc = null_pc;
   unsigned num_divergent_paths = 0;
-
+  
+  //下面一个while循环是获取divergent_paths。divergent_paths是分支路径的映射，是从 address_type->
+  //simt_mask_t 映射的Map。正常的分支路径不超过2，if...else if...else...的分支处理也是按照两个分支
+  //路径的嵌套进行。以下是一个实例：
+  //                  entry
+  //                   \|/
+  //          <———Yes—— A/1111 ——No———>
+  //    ———B/1110———                   |
+  //   |            |                  |
+  //   |            |                 \|/
+  // C/1000       D/0110             F/0001
+  //   |            |                  |
+  //   |            |                  |
+  //    ————\|/—————                   |
+  //       E/1110                      |
+  //         |                         |
+  //        \|/————————————————————————
+  //       G/1111
+  //
+  //SIMT Stack Initial State:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  B             1110
+  //SIMT Stack After Divergent Branch:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  E             1110 (i)
+  //          E                  D             0110 (ii)
+  //          E                  C             1000 (iii)
+  //SIMT Stack After Reconvergence:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  E             1110
+  //
+  //当SIMT堆栈处于（SIMT Stack Initial State）状态时，按照下述循环：
+  // 1.第一次进while: top_active_mask=1110
+  //                 tmp_next_pc = null_pc
+  //                 tmp_active_mask = null
+  //                 i=4-1=3, top_active_mask.test(3)=false;
+  //                 i=4-2=2, top_active_mask.test(2)=true:
+  //                     if thread_done.test(2)=true:
+  //                         top_active_mask=1100
+  //                     elif (tmp_next_pc == null_pc)=true:
+  //                         tmp_next_pc = next_pc[2]
+  //                         tmp_active_mask = 0010
+  //                         top_active_mask = 1100
+  //                 i=4-3=1, top_active_mask.test(1)=true:
+  //                     if thread_done.test(1)=true:
+  //                         top_active_mask=1000
+  //                     elif (tmp_next_pc == next_pc[1])=true:
+  //                         //next_pc[1]=next_pc[2]
+  //                         tmp_active_mask = 0110
+  //                         top_active_mask = 1000
+  //                     elif (tmp_next_pc == next_pc[1])=false:
+  //                         //next_pc[1]!=next_pc[2]
+  //                         tmp_active_mask = 0010
+  //                         top_active_mask = 1100
+  //                 i=4-4=0, top_active_mask.test(0)=true:
+  //                     if thread_done.test(0)=true:
+  //                         top_active_mask=0000
+  //                     elif (tmp_next_pc == next_pc[0])=true: 
+  //                         //next_pc[0]=next_pc[1]=next_pc[2]
+  //                         tmp_active_mask = 1110
+  //                         top_active_mask = 0000
+  //                     elif (tmp_next_pc == next_pc[0])=false:
+  //                         //next_pc[0]!=next_pc[1]=next_pc[2]
+  //                         tmp_active_mask = 0110
+  //                         top_active_mask = 1000 //进第2次while循环
+  //                     elif (tmp_next_pc == next_pc[0])=true:
+  //                         //next_pc[0]=next_pc[2]!=next_pc[1]
+  //                         tmp_active_mask = 1110
+  //                         top_active_mask = 0000
+  //                     elif (tmp_next_pc == next_pc[0])=false:
+  //                         //next_pc[1]!=next_pc[0]!=next_pc[2]!=next_pc[1]
+  //                         tmp_active_mask = 0010
+  //                         top_active_mask = 1100 //进第2次while循环
+  //                 divergent_paths[tmp_next_pc] = tmp_active_mask;
+  //                 num_divergent_paths++;
+  //因此，第一次循环首先是判断第2号线程的NPC是否等于第1号线程的NPC，等于的话把top_active_mask(1)置
+  //零，说明第1号线程的分支路径与第1号线程的相同；不等于的话就不处理top_active_mask(1)，以便下次进
+  //入while循环，将第1号线程单独作为一个分支路径，再循环其余线程找与第1号线程分支路径相同的线程。而
+  //后再继续比较第0号线程的NPC是否与第2号线程的NPC相同，比较方法类似。比较过程中，与第2号线程的NPC
+  //相同的线程，在tmp_next_pc中做标记即置1。在第一次while循环末尾，将第2号线程的NPC作为key，并且将
+  //tmp_next_pc作为value保存到字典divergent_paths中，并将不同分支路径的计数值num_divergent_paths
+  //加1。之后进入第二次循环，生成第二个单独的分支路径。如此以往，等到while循环跳出时，就找到了所有的
+  //分支路径。
   std::map<address_type, simt_mask_t> divergent_paths;
+  //bitset::any()是C++ STL中的内置函数，如果数字中至少设置了一位，则返回True。如果未设置所有位或数
+  //字为零，则返回False。
   while (top_active_mask.any()) {
     // extract a group of threads with the same next PC among the active threads
     // in the warp
+    //在warp中的所有活跃线程中提取具有相同的NPC(next PC)的一组线程。
     address_type tmp_next_pc = null_pc;
     simt_mask_t tmp_active_mask;
+    //对warp中的所有线程进行循环。
     for (int i = m_warp_size - 1; i >= 0; i--) {
+      //如果栈顶活跃线程掩码标识该线程是开启的。
       if (top_active_mask.test(i)) {  // is this thread active?
+        //thread_done也是线程掩码，如果某个线程已经被执行完毕，就对应位置1。
         if (thread_done.test(i)) {
+          //线程执行完毕，设置活跃线程掩码的对应位置零，这里是为了下次再更新SIMT堆栈时就不再进第i个
+          //线程while循环了。
           top_active_mask.reset(i);  // remove completed thread from active mask
         } else if (tmp_next_pc == null_pc) {
+          //当前线程尚未执行完毕，获取当前线程的NPC和设置活跃线程掩码对应位。
           tmp_next_pc = next_pc[i];
           tmp_active_mask.set(i);
+          //处理上述两句后，设置活跃线程掩码的对应位置零，这里是为了下次再更新SIMT堆栈时就不再进第
+          //i个线程while循环了。
           top_active_mask.reset(i);
         } else if (tmp_next_pc == next_pc[i]) {
           tmp_active_mask.set(i);
+          //处理上述两句后，设置活跃线程掩码的对应位置零，这里是为了下次再更新SIMT堆栈时就不再进第
+          //i个线程while循环了。
           top_active_mask.reset(i);
         }
       }
     }
-
+    //warp中所有的线程都循环一遍后，若tmp_next_pc==null_pc，则说明所有线程都已经结束。
     if (tmp_next_pc == null_pc) {
       assert(!top_active_mask.any());  // all threads done
       continue;
     }
-
+    //加入到分支路径中。
     divergent_paths[tmp_next_pc] = tmp_active_mask;
     num_divergent_paths++;
   }
 
+  //栈顶NPC === next_inst_pc，即top_pc == next_inst_pc。
   address_type not_taken_pc = next_inst_pc + next_inst_size;
+  //正常的分支路径不超过2，if...else if...else...的分支处理也是按照两个分支路径的嵌套进行。
   assert(num_divergent_paths <= 2);
+  //依然选择上面的实例：
+  //                  entry
+  //                   \|/
+  //          <———Yes—— A/1111 ——No———>
+  //    ———B/1110———                   |
+  //   |            |                  |
+  //   |            |                 \|/
+  // C/1000       D/0110             F/0001
+  //   |            |                  |
+  //   |            |                  |
+  //    ————\|/—————                   |
+  //       E/1110                      |
+  //         |                         |
+  //        \|/————————————————————————
+  //       G/1111
+  //
+  //SIMT Stack Initial State:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  B             1110
+  //SIMT Stack After Divergent Branch:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  E             1110 (i)
+  //          E                  D             0110 (ii)
+  //          E                  C             1000 (iii)
+  //SIMT Stack After Reconvergence:
+  //    Ret./Reconv. PC       Next PC       Active Mask
+  //          -                  G             1111
+  //          G                  F             0001
+  //          G                  E             1110
+  //
+  //我们选择下面的一个状态（SIMT Stack After Reconvergence）来分析，此时的SIMT堆栈的状态为：
+  //    SIMT Stack Initial State:
+  //        Ret./Reconv. PC       Next PC       Active Mask
+  //              -                  G             1111
+  //              G                  F             0001
+  //              G                  B             1110
+  //根据上面寻找分支路径来说：
+  //    B开始分支出两个路径，num_divergent_paths = 2，两个路径分别是：
+  //        路径0：divergent_paths[C] = 1000
+  //        路径1：divergent_paths[D] = 0110
+  //not_taken_pc = next_pc(B)+1 = D
+  //对路径0：tmp_next_pc = null_pc
+  //        tmp_active_mask = 0000
+  //        D在divergent_paths中：
+  //            tmp_next_pc = not_taken_pc = next_pc(B)+1 = D
+  //            tmp_active_mask = divergent_paths[D] = 0110
+  //            del divergent_paths[D]
+  //        
+  //???
+  //???
+  //???
   for (unsigned i = 0; i < num_divergent_paths; i++) {
     address_type tmp_next_pc = null_pc;
     simt_mask_t tmp_active_mask;
@@ -1113,6 +1605,7 @@ void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
     }
 
     // HANDLE THE SPECIAL CASES FIRST
+    //首先处理特殊case，包括call、ret指令。
     if (next_inst_op == CALL_OPS) {
       // Since call is not a divergent instruction, all threads should have
       // executed a call instruction
@@ -1189,10 +1682,15 @@ void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
 }
 
 void core_t::execute_warp_inst_t(warp_inst_t &inst, unsigned warpId) {
+  //t是指thread ID号，m_warp_size为warp的大小，即一个warp中线程的数量。
   for (unsigned t = 0; t < m_warp_size; t++) {
+    //判断活跃编码，即判断由于分支的情况，该线程对当前指令的执行情况，inst.active(t)为1时，执行；
+    //inst.active(t)为0时，不执行。
     if (inst.active(t)) {
       if (warpId == (unsigned(-1))) warpId = inst.warp_id();
+      //计算当前线程编号。
       unsigned tid = m_warp_size * warpId + t;
+      //让第t个线程执行inst指令。
       m_thread[tid]->ptx_exec_inst(inst, t);
 
       // virtual function
@@ -1206,10 +1704,17 @@ bool core_t::ptx_thread_done(unsigned hw_thread_id) const {
           m_thread[hw_thread_id]->is_done());
 }
 
+/*
+更新SIMT堆栈的预先处理。
+*/
 void core_t::updateSIMTStack(unsigned warpId, warp_inst_t *inst) {
+  //thread_done也是线程掩码，如果某个线程已经被执行完毕，就对应位置1。
   simt_mask_t thread_done;
+  //next_pc是一个地址向量，addr_vector_t定义为：
+  //    typedef std::vector<address_type> addr_vector_t;
   addr_vector_t next_pc;
   unsigned wtid = warpId * m_warp_size;
+  //对warp内的所有线程循环。
   for (unsigned i = 0; i < m_warp_size; i++) {
     if (ptx_thread_done(wtid + i)) {
       thread_done.set(i);
@@ -1220,6 +1725,7 @@ void core_t::updateSIMTStack(unsigned warpId, warp_inst_t *inst) {
       next_pc.push_back(m_thread[wtid + i]->get_pc());
     }
   }
+  //更新SIMT堆栈的对象。
   m_simt_stack[warpId]->update(thread_done, next_pc, inst->reconvergence_pc,
                                inst->op, inst->isize, inst->pc);
 }

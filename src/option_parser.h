@@ -35,6 +35,7 @@
 typedef class OptionParser *option_parser_t;
 
 // data type of the option
+// 定义选项注册时的选项数据类型
 enum option_dtype {
   OPT_INT32,
   OPT_UINT32,

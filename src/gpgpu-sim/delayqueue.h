@@ -42,21 +42,31 @@ struct fifo_data {
   fifo_data* m_next;
 };
 
+/*
+从内存分区微架构模型部分描述的子组件来看，data_cache类型的成员对象为二级缓存建模，dram_t类型为片外
+DRAM Channel，各种队列是使用fifo_pipeline类来建模的。
+*/
 template <class T>
 class fifo_pipeline {
  public:
+  //构造函数。三个参数分别为：
+  //    nm：队列的name，字符串。
+  //    minlen：队列的最小长度。
+  //    maxlen：队列的最大长度。
   fifo_pipeline(const char* nm, unsigned int minlen, unsigned int maxlen) {
     assert(maxlen);
     m_name = nm;
     m_min_len = minlen;
     m_max_len = maxlen;
+    //队列的当前长度。
     m_length = 0;
+    //队列中的元素个数。
     m_n_element = 0;
     m_head = NULL;
     m_tail = NULL;
     for (unsigned i = 0; i < m_min_len; i++) push(NULL);
   }
-
+  //析构函数。
   ~fifo_pipeline() {
     while (m_head) {
       m_tail = m_head;
@@ -64,9 +74,10 @@ class fifo_pipeline {
       delete m_tail;
     }
   }
-
+  //向队列中压栈，压入数据data。data存在m_tail->next指向的位置。
   void push(T* data) {
     assert(m_length < m_max_len);
+    //如果m_head不为空，则说明当前状态下，队列中已经有元素。
     if (m_head) {
       if (m_tail->m_data || m_length < m_min_len) {
         m_tail->m_next = new fifo_data<T>();
@@ -82,7 +93,7 @@ class fifo_pipeline {
     m_tail->m_next = NULL;
     m_tail->m_data = data;
   }
-
+  //弹出m_head指向的元素。
   T* pop() {
     fifo_data<T>* next;
     T* data;
@@ -110,7 +121,7 @@ class fifo_pipeline {
     }
     return data;
   }
-
+  //仅返回（不弹出）m_head指向的元素。
   T* top() const {
     if (m_head) {
       return m_head->m_data;
@@ -126,6 +137,7 @@ class fifo_pipeline {
       m_min_len = new_min_len;
       while (m_length < m_min_len) {
         push(NULL);
+        //push里每压入一个元素就会m_n_element++，因此后面应该把压入NULL增加的减去。
         m_n_element--;  // uncount NULL elements inserted to create delays
       }
     } else {
@@ -152,14 +164,19 @@ class fifo_pipeline {
       }
     }
   }
-
+  //返回是否队列已满。
   bool full() const { return (m_max_len && m_length >= m_max_len); }
+  //size数量的数据放入队列中，可以放下返回False，放不下返回True。
   bool is_avilable_size(unsigned size) const {
     return (m_max_len && m_length + size - 1 >= m_max_len);
   }
+  //返回是否队列为空。
   bool empty() const { return m_head == NULL; }
+  //返回队列中的元素个数。
   unsigned get_n_element() const { return m_n_element; }
+  //返回队列的长度。
   unsigned get_length() const { return m_length; }
+  //返回队列的长度。
   unsigned get_max_len() const { return m_max_len; }
 
   void print() const {

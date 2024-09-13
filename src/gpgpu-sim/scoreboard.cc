@@ -31,7 +31,10 @@
 #include "shader.h"
 #include "shader_trace.h"
 
-// Constructor
+/*
+Constructor.
+构造函数，设置SM的ID，初始化reg_table和longopregs的大小。
+*/
 Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu)
     : longopregs() {
   m_sid = sid;
@@ -42,7 +45,10 @@ Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu)
   m_gpu = gpu;
 }
 
-// Print scoreboard contents
+/*
+Print scoreboard contents.
+打印记分牌的内容。
+*/
 void Scoreboard::printContents() const {
   printf("scoreboard contents (sid=%d): \n", m_sid);
   for (unsigned i = 0; i < reg_table.size(); i++) {
@@ -55,6 +61,9 @@ void Scoreboard::printContents() const {
   }
 }
 
+/*
+将单个目标寄存器保留在相应硬件warp的记分牌中。
+*/
 void Scoreboard::reserveRegister(unsigned wid, unsigned regnum) {
   if (!(reg_table[wid].find(regnum) == reg_table[wid].end())) {
     printf(
@@ -68,7 +77,10 @@ void Scoreboard::reserveRegister(unsigned wid, unsigned regnum) {
   reg_table[wid].insert(regnum);
 }
 
-// Unmark register as write-pending
+/*
+Unmark register as write-pending.
+将单个目标寄存器释放。
+*/
 void Scoreboard::releaseRegister(unsigned wid, unsigned regnum) {
   if (!(reg_table[wid].find(regnum) != reg_table[wid].end())) return;
   SHADER_DPRINTF(SCOREBOARD, "Release register - warp:%d, reg: %d\n", wid,
@@ -80,6 +92,9 @@ const bool Scoreboard::islongop(unsigned warp_id, unsigned regnum) {
   return longopregs[warp_id].find(regnum) != longopregs[warp_id].end();
 }
 
+/*
+发射指令时，其目标寄存器将保留在相应硬件warp的记分牌中。
+*/
 void Scoreboard::reserveRegisters(const class warp_inst_t* inst) {
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst->out[r] > 0) {
@@ -106,7 +121,10 @@ void Scoreboard::reserveRegisters(const class warp_inst_t* inst) {
   }
 }
 
-// Release registers for an instruction
+/*
+Release registers for an instruction.
+当指令完成写回时，其目标寄存器将被释放。
+*/
 void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst->out[r] > 0) {
@@ -125,6 +143,9 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
  * @return
  * true if WAW or RAW hazard (no WAR since in-order issue)
  **/
+/*
+检测冒险，检测某个指令使用的寄存器是否被保留在记分板中，如果有的话就是发生了 WAW 或 RAW 冒险。
+*/
 bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
   // Get list of all input and output registers
   std::set<int> inst_regs;
@@ -149,6 +170,10 @@ bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
   return false;
 }
 
+/*
+返回记分牌的reg_table中是否有挂起的写入。warp id指向的reg_table为空的话，代表没有挂起的写入，返回
+false。[挂起的写入]是指wid是否有已发射但尚未完成的指令，将目标寄存器保留在记分牌。
+*/
 bool Scoreboard::pendingWrites(unsigned wid) const {
   return !reg_table[wid].empty();
 }

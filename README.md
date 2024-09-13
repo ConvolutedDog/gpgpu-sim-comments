@@ -178,9 +178,21 @@ GPGPU-Sim dependencies:
 - zlib
 - CUDA Toolkit
 
-GPGPU-Sim documentation dependencies:
+`makedepend` installation on CentOS:
+```shell
+wget http://xorg.freedesktop.org/archive/individual/util/makedepend-1.0.5.tar.bz2
+tar -jxvf makedepend-1.0.5.tar.bz2
+cd makedepend-1.0.5
+make && make install
+```
+
+GPGPU-Sim documentation dependencies for Ubuntu:
 - doxygen
 - graphvi
+
+GPGPU-Sim documentation dependencies for CentOS:
+- doxygen
+- graphviz
 
 AerialVision dependencies:
 - python-pmw
@@ -194,21 +206,33 @@ We used gcc/g++ version 4.5.1, bison version 2.4.1, and flex version 2.5.35.
 If you are using Ubuntu, the following commands will install all required
 dependencies besides the CUDA Toolkit.
 
-GPGPU-Sim dependencies:
+GPGPU-Sim dependencies for Ubuntu:
 
 	sudo apt-get install build-essential xutils-dev bison zlib1g-dev flex libglu1-mesa-dev
+
+GPGPU-Sim dependencies for CentOS:
+
+	yum install xorg-x11-utils freeglut-devel bison zlib flex
 
 GPGPU-Sim documentation dependencies:
 
 	sudo apt-get install doxygen graphviz
 
-AerialVision dependencies:
+AerialVision dependencies for Ubuntu:
 
-	sudo apt-get install python-pmw python-ply python-numpy libpng12-dev python-matplotlib
+        sudo apt-get install python-pmw python-ply python-numpy libpng12-dev python-matplotlib
 
-CUDA SDK dependencies:
+AerialVision dependencies for CentOS:
 
-	sudo apt-get install libxi-dev libxmu-dev libglut3-dev
+	sudo yum install python-pmw python-ply python-numpy libpng-dev python3-matplotlib
+
+CUDA SDK dependencies for Ubuntu:
+
+        sudo apt-get install libxi-dev libxmu-dev libglut3-dev
+
+CUDA SDK dependencies for CentOS:
+
+	sudo yum install libxi-dev libxmu-dev freeglut3-dev
 
 If you are running applications which use NVIDIA libraries such as cuDNN and 
 cuBLAS, install them too.

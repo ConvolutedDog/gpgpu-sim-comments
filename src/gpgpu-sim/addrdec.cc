@@ -47,6 +47,8 @@ linear_to_raw_address_translation::linear_to_raw_address_translation() {
   ADDR_CHIP_S = 10;
   memset(addrdec_mklow, 0, N_ADDRDEC);
   memset(addrdec_mkhigh, 64, N_ADDRDEC);
+  // addrdec_mask的索引：
+  //    enum { CHIP = 0, BK = 1, ROW = 2, COL = 3, BURST = 4, N_ADDRDEC };
   addrdec_mask[0] = 0x0000000000001C00;
   addrdec_mask[1] = 0x0000000000000300;
   addrdec_mask[2] = 0x000000000FFF0000;
@@ -283,14 +285,18 @@ void linear_to_raw_address_translation::init(
     unsigned int n_channel, unsigned int n_sub_partition_in_channel) {
   unsigned i;
   unsigned long long int mask;
+  //地址中需要指示哪个channel的位数。
   unsigned int nchipbits = ::LOGB2_32(n_channel);
   log2channel = nchipbits;
+  //地址中需要指示单个channel中哪个sub partition的位数。
   log2sub_partition = ::LOGB2_32(n_sub_partition_in_channel);
   m_n_channel = n_channel;
   m_n_sub_partition_in_channel = n_sub_partition_in_channel;
   nextPowerOf2_m_n_channel = ::next_powerOf2(n_channel);
   m_n_sub_partition_total = n_channel * n_sub_partition_in_channel;
 
+  // 实际配置的channel数 - 2^(log2(channel))，如果channel不是2的幂次方，
+  // 那么nchipbits需要增加一个bit，以便能够表示所有的channel。
   gap = (n_channel - ::powli(2, nchipbits));
   if (gap) {
     nchipbits++;
@@ -551,6 +557,24 @@ static long int powli(long int x, long int y)  // compute x to the y
   return r;
 }
 
+/*
+这段代码是一个用于计算一个无符号32位整数的以2为底的对数的函数。简单来说，它返回的是把
+给定的无符号整数值v转换为2的幂次形式时的幂次。这个函数的实现采用的是位操作和位移的方
+法，非常高效。它的工作原理：
+1. 函数初始化两个无符号整数变量`shift`和`r`。这里`r`将会保存最终计算得到的对数值，初
+始为0。
+2. 第一步，判断整数`v`的高16位是否有不为0的位。如果有（`v & 0xFFFF0000 != 0`），则
+`shift`被设为16（因为`1 << 4`等于16）。然后将`v`向右位移`shift`位，这实际上是把`v`
+的高16位舍去，并将结果存回`v`。接着，`shift`的值被加到`r`上，用于记录当前的对数增量。
+3. 接下来的每一步都是在处理更小的位段：接下来是高8位、4位、2位以及最后的1位。除了最开
+始是判断高16位之外，接下来的步骤都是采用类似的逻辑来判断更低位段的值，并通过位移操作来
+更新`v`和`r`。
+4. 在这个过程中，每次判断都是看当前这部分是否包含二进制位。如果包含，则意味着要在结果
+上累加当前的位段所对应的二进制位数。
+5. 最终，`r`中保存的就是输入值`v`的以2为底的对数值。
+举个例子，如果输入`v = 8`，该函数返回的结果会是3，因为`2^3 = 8`。这个函数经常用于需
+要高效率进行数学运算的场合，尤其是在计算机图形、硬件设计和其他需要位操作的系统中。
+*/
 static unsigned int LOGB2_32(unsigned int v) {
   unsigned int shift;
   unsigned int r;

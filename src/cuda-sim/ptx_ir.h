@@ -46,15 +46,73 @@
 
 class gpgpu_context;
 
+/*
+type_info_key 包含关于数据对象类型的信息（在指令解释期间使用）。
+*/
 class type_info_key {
  public:
+  //构造函数。
   type_info_key() {
+    //m_is_non_arch_reg 的意思详见 void set_is_non_arch_reg() 的注释。
     m_is_non_arch_reg = false;
+    //标志是否已经完成 type_info_key 对象中的各成员变量的初始化。
     m_init = false;
   }
+  //构造函数，以及初始化成员变量。六个参数为：
+  //  1.memory_space_t space_spec：GPGPU-Sim设置的存储空间的类型有：
+  //    enum _memory_space_t {
+  //      //a. 未定义的空间类型
+  //      undefined_space = 0,
+  //      //b. 寄存器
+  //      reg_space,
+  //      //c. local memory
+  //      local_space,
+  //      //d. shared memory
+  //      shared_space,
+  //      //e. 貌似是 shared static array，其访存的行为与shared memory一致，可以认为其是shared 
+  //      //   memory的一种
+  //      sstarr_space,
+  //      //f. 通用参数存储
+  //      param_space_unclassified,
+  //      //g. 对内核中的所有线程：全局性的，只读的
+  //      param_space_kernel, // global to all threads in a kernel : read-only
+  //      //h. 对某个线程：私有的，可读写的
+  //      param_space_local,  // local to a thread : read-writable
+  //      //i. 常量缓存
+  //      const_space,
+  //      //j. 纹理缓存
+  //      tex_space,
+  //      //k. 渲染曲面 // render surfaces 
+  //      surf_space,
+  //      //l. 全局存储
+  //      global_space,
+  //      //m. 通用存储
+  //      generic_space,
+  //      //n. 指令存储
+  //      instruction_space
+  //    };
+  //  2.int scalar_type_spec：在ptx_tab.h定义的yytokentype中枚举，指的是标量数据类型。例如：
+  //        enum yytokentype
+  //        {
+  //          ......
+  //          U8_TYPE = 307,
+  //          U16_TYPE = 308,
+  //          U32_TYPE = 309,
+  //          U64_TYPE = 310,
+  //          F16_TYPE = 311,
+  //          F32_TYPE = 312,
+  //          F64_TYPE = 313,
+  //          PRED_TYPE = 321,
+  //          ......
+  //        };
+  //  3.int vector_spec：
+  //  4.int alignment_spec：
+  //  5.int extern_spec：
+  //  6.int array_dim：
   type_info_key(memory_space_t space_spec, int scalar_type_spec,
                 int vector_spec, int alignment_spec, int extern_spec,
                 int array_dim) {
+    //m_is_non_arch_reg 的意思详见 void set_is_non_arch_reg() 的注释。 
     m_is_non_arch_reg = false;
     m_init = true;
     m_space_spec = space_spec;
@@ -65,7 +123,10 @@ class type_info_key {
     m_array_dim = array_dim;
     m_is_function = 0;
   }
+  //设置一个类型信息关键字（type_info_key）是否是一个函数。它可以用于检测函数是否已被定义，以及函数的参
+  //数类型是否正确。
   void set_is_func() {
+    //检测当前type_info_key对象是否已经初始化过。
     assert(!m_init);
     m_init = true;
     m_space_spec = undefined_space;
@@ -82,8 +143,16 @@ class type_info_key {
     assert(m_init);
     return m_array_dim;
   }
-  void set_is_non_arch_reg() { m_is_non_arch_reg = true; }
 
+  //在处理PTX指令时，有可能会遇到一条指令中存在寄存器："_"（暂时我跑的代码里还没遇到过这种带有"_"寄存
+  //器的指令）。m_is_non_arch_reg 用于支持表示为"_"的寄存器的初始设置代码。当未读取或写入指令操作数
+  //时，使用此寄存器。然而，解析器必须将其识别为合法的寄存器，但我们不想将其传递给微体系结构寄存器，传递
+  //给性能模拟器。为此，我们向符号表中添加一个符号，但将其标记为non_arch_reg，这样不会影响性能模拟。并
+  //且，在这里，将带有"_"寄存器的指令中的"_"设置为null_key（null_key就是当前类的一个对象），并设置
+  //null_key.set_is_non_arch_reg()。
+  void set_is_non_arch_reg() { m_is_non_arch_reg = true; }
+  
+  //m_is_non_arch_reg 的意思详见 void set_is_non_arch_reg() 的注释。
   bool is_non_arch_reg() const { return m_is_non_arch_reg; }
   bool is_reg() const { return m_space_spec == reg_space; }
   bool is_param_kernel() const { return m_space_spec == param_space_kernel; }
@@ -112,6 +181,7 @@ class type_info_key {
   int m_extern_spec;
   int m_array_dim;
   int m_is_function;
+  //m_is_non_arch_reg 的意思详见 void set_is_non_arch_reg() 的注释。
   bool m_is_non_arch_reg;
 
   friend struct type_info_key_compare;
@@ -134,6 +204,9 @@ struct type_info_key_compare {
   }
 };
 
+/*
+type_info 包含关于数据对象类型的信息（在指令解释期间使用）。
+*/
 class type_info {
  public:
   type_info(symbol_table *scope, type_info_key t) { m_type_info = t; }
@@ -299,6 +372,10 @@ class symbol {
   std::list<operand_info> m_initializer;
 };
 
+/*
+符号表。包含PTX中一个内存位置的文本表示（e.g., "%r2", "input_data", etc...）到一个包含数据类型和位置
+信息的符号对象的映射。
+*/
 class symbol_table {
  public:
   symbol_table();
@@ -378,8 +455,12 @@ class symbol_table {
   std::map<std::string, symbol_table *> m_inst_group_symtab;
 };
 
+/*
+一个包含指令源操作数的封装类，可以是寄存器标识符、内存操作数（包括置换模式信息）或即时操作数。
+*/
 class operand_info {
  public:
+  //构造函数。
   operand_info(gpgpu_context *ctx) {
     init(ctx);
     m_is_non_arch_reg = false;
@@ -658,12 +739,21 @@ class operand_info {
   void make_memory_operand() { m_type = memory_t; }
   void set_return() { m_is_return_var = true; }
   void set_immediate_addr() { m_immediate_address = true; }
+  //返回操作数的名称。例如，pI为一条ptx_instruction *类型的指令，pI->dst().name().c_str()返回目
+  //的操作数的名称。
   const std::string &name() const {
     assert(m_type == symbolic_t || m_type == reg_t || m_type == address_t ||
            m_type == memory_t || m_type == label_t);
     return m_value.m_symbolic->name();
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的元素个数。例如，pI为一条ptx_instruction *类型的
+  //指令，pI->dst().get_vect_nelem()返回目的操作数的元素个数。操作数是向量的例子：
+  //wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32
+  //                  {%f260, %f261, %f262, %f263, %f264, %f265, %f266, %f267}, 
+  //                  {%r144, %r145, %r146, %r147, %r148, %r149, %r150, %r151}, 
+  //                  {%r152, %r153, %r154, %r155, %r156, %r157, %r158, %r159}, 
+  //                  {%f260, %f261, %f262, %f263, %f264, %f265, %f266, %f267}; 
+  //pI->dst().get_vect_nelem()返回值为8。
   unsigned get_vect_nelem() const {
     assert(is_vector());
     if (!m_value.m_vector_symbolic[0]) return 0;
@@ -676,34 +766,34 @@ class operand_info {
     if (!m_value.m_vector_symbolic[7]) return 7;
     return 8;
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的第idx个元素。
   const symbol *vec_symbol(int idx) const {
     assert(idx < 8);
     const symbol *result = m_value.m_vector_symbolic[idx];
     assert(result != NULL);
     return result;
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的第0个元素的名称。
   const std::string &vec_name1() const {
     assert(m_type == vector_t);
     return m_value.m_vector_symbolic[0]->name();
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的第1个元素的名称。
   const std::string &vec_name2() const {
     assert(m_type == vector_t);
     return m_value.m_vector_symbolic[1]->name();
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的第2个元素的名称。
   const std::string &vec_name3() const {
     assert(m_type == vector_t);
     return m_value.m_vector_symbolic[2]->name();
   }
-
+  //如果一个操作数是向量，则返回这个向量操作数中的第3个元素的名称。
   const std::string &vec_name4() const {
     assert(m_type == vector_t);
     return m_value.m_vector_symbolic[3]->name();
   }
-
+  //判断一个操作数是否是寄存器。
   bool is_reg() const {
     if (m_type == reg_t) {
       return true;
@@ -722,12 +812,20 @@ class operand_info {
     if (m_type != symbolic_t) return false;
     return m_value.m_symbolic->type()->get_key().is_param_kernel();
   }
-
+  //判断一个操作数是否是向量，如果是则返回true，否则返回false。例如，pI为一条ptx_instruction *类
+  //型的指令，pI->dst().is_vector()返回目的操作数是否是向量。操作数是向量的例子：
+  //wmma.mma.sync.aligned.row.col.m16n16k16.f32.f32
+  //                  {%f260, %f261, %f262, %f263, %f264, %f265, %f266, %f267}, 
+  //                  {%r144, %r145, %r146, %r147, %r148, %r149, %r150, %r151}, 
+  //                  {%r152, %r153, %r154, %r155, %r156, %r157, %r158, %r159}, 
+  //                  {%f260, %f261, %f262, %f263, %f264, %f265, %f266, %f267}; 
   bool is_vector() const {
     if (m_vector) return true;
     return false;
   }
+  //返回操作数寄存器编号。
   int reg_num() const { return m_value.m_symbolic->reg_num(); }
+  //如果一个操作数是向量，则返回这个向量操作数中的第0个寄存器编号。
   int reg1_num() const { return m_value.m_vector_symbolic[0]->reg_num(); }
   int reg2_num() const { return m_value.m_vector_symbolic[1]->reg_num(); }
   int reg3_num() const {
@@ -889,13 +987,22 @@ class operand_info {
 };
 
 extern const char *g_opcode_string[];
+
+/*
+PTX指令代码块的基本块。
+*/
 struct basic_block_t {
   basic_block_t(unsigned ID, ptx_instruction *begin, ptx_instruction *end,
                 bool entry, bool ex) {
+    //basic block的唯一标识。
     bb_id = ID;
+    //ptx_begin是该基本块的首条PTX指令。
     ptx_begin = begin;
+    //ptx_end是该基本块的末尾PTX指令。
     ptx_end = end;
+    //is_entry标志该基本块是否是入口处的基本块。
     is_entry = entry;
+    //is_exit标志该基本块是否是出口处的基本块。
     is_exit = ex;
     immediatepostdominator_id = -1;
     immediatedominator_id = -1;
@@ -934,6 +1041,12 @@ struct gpgpu_recon_t {
   class ptx_instruction *target_inst;
 };
 
+/*
+单条PTX指令类。时序仿真中需要的指令数据。每条指令（ptx_instruction）承自 warp_inst_t，包含用于时序和
+功能仿真的数据。 ptx_instruction 在功能仿真时被填充。在这一级之后,程序只需要时序信息,所以它将 ptx_ins
+truction 转为 warp_inst_t（一些数据被释放）用于时序模拟。它持有 warp_id、warp内的活动线程掩码、内存
+访问列表（mem_access_t）和该warp内线程的信息（per_thread_info）。
+*/
 class ptx_instruction : public warp_inst_t {
  public:
   ptx_instruction(int opcode, const symbol *pred, int neg_pred, int pred_mod,
@@ -943,43 +1056,113 @@ class ptx_instruction : public warp_inst_t {
                   const std::list<int> &scalar_type, memory_space_t space_spec,
                   const char *file, unsigned line, const char *source,
                   const core_config *config, gpgpu_context *ctx);
-
+  //调用ptx_instruction::print_insn(FILE *fp)，传入参数stdout，打印指令到屏幕。
   void print_insn() const;
+  //传入参数 FILE *fp，打印指令到该文件。
   virtual void print_insn(FILE *fp) const;
+  //将该指令转换为一个字符串，并返回该字符串。
   std::string to_string() const;
+  //返回指令的大小，m_inst_size即为指令的大小，以字节为单位。
   unsigned inst_size() const { return m_inst_size; }
+  //UID是 Unique Identifier 的缩写，用于标识特定的对象、任务或者线程。它可以用来跟踪对象、任务或者线
+  //程的执行，以及收集相关的性能指标。uid() 用于获取当前指令的唯一ID。
   unsigned uid() const { return m_uid; }
+  //获取当前指令的操作码 m_opcode，该操作码是一个 int 类型的值，与 opcodes.def 中定义的操作码对应。
+  //例如， opcodes.def 中定义了：
+  //    OP_DEF(ABS_OP,abs_impl,"abs",1,1)
+  //其操作码为 ABS_OP。
   int get_opcode() const { return m_opcode; }
+  //获取当前指令操作码定义中的字符串，例如上面的 opcodes.def 中的定义中，
+  //    OP_DEF(ABS_OP,abs_impl,"abs",1,1)
+  //其中，"abs"即为g_opcode_string[m_opcode]。
   const char *get_opcode_cstr() const {
+    //当 m_opcode != -1 时为正常指令，当m_opcode == -1时为标签。
     if (m_opcode != -1) {
       return g_opcode_string[m_opcode];
     } else {
       return "label";
     }
   }
+  //返回该指令所在的源文件。
   const char *source_file() const { return m_source_file.c_str(); }
+  //返回该指令所在的源文件的行数。
   unsigned source_line() const { return m_source_line; }
+  //返回m_operands变量（一个 std::vector 对象）的大小，即当前指令操作数的数量。
   unsigned get_num_operands() const { return m_operands.size(); }
+  //下面的函数返回是否含有谓词寄存器，m_pred 是一个 symbol 类的对象。关于谓词指令，看下面的PTX指令：
+  //  1.      asm("{\n\t"
+  //  2.          ".reg .s32 b;\n\t"
+  //  3.          ".reg .pred p;\n\t"     <======= 声明谓词寄存器p
+  //  4.          "add.cc.u32 %1, %1, %2;\n\t"
+  //  5.          "addc.s32 b, 0, 0;\n\t"
+  //  6.          "sub.cc.u32 %0, %0, %2;\n\t"
+  //  7.          "subc.cc.u32 %1, %1, 0;\n\t"
+  //  8.          "subc.s32 b, b, 0;\n\t"
+  //  9.          "setp.eq.s32 p, b, 1;\n\t"     <======= 给谓词变量绑定具体谓词逻辑
+  //  10.         "@p add.cc.u32 %0, %0, 0xffffffff;\n\t"
+  //  11.         "@p addc.u32 %1, %1, 0;\n\t"
+  //  12.         "}"
+  //  13.         : "+r"(x[0]), "+r"(x[1])
+  //  14.         : "r"(x[2]));
+  //谓词的声明使用 .pred 表示，例如第3行声明了谓词寄存器p。step指令给谓词变量绑定具体谓词逻辑，例如
+  //第9行 "setp.eq.s32 p, b, 1"。
+  //谓词的使用方法/指令格式为：
+  //        @p opcode;
+  //        @p opcode a;
+  //        @p opcode d, a;
+  //        @p opcode d, a, b;
+  //        @p opcode d, a, b, c;
+  //最左边的 @p是可选的guard predicate，即根据对应谓词结果选择是否执行该条指令。
+  //谓词寄存器本质上是虚拟的寄存器，用于处理PTX中的分支（类比其他ISA的条件跳转指令beq等）。
+  //SASS指令使用4位条件代码来指定更复杂的谓词行为，而不是PTX中的正常真假谓词系统。因此，PTXPlus使用
+  //相同的4位谓词系统。GPGPU-Sim使用decuda的谓词转换表来模拟PTXPlus指令。谓词寄存器的最高位表示溢出
+  //标志，后跟进位标志和符号标志。最后也是最低的位是零标志。单独的条件代码可以存储在单独的谓词寄存器中，
+  //指令可以指示要使用或修改哪个谓词寄存器。以下指令将寄存器$r0中的值与寄存器$r1中的值相加，并将结果存
+  //储在寄存器$r2中。同时，在谓词寄存器$p0中设置适当的标志：
+  //        add.u32 $p0|$r2, $r0, $r1;
+  //可以对谓词指令使用不同的测试条件。例如，只有当谓词寄存器$p0中的进位标志位被设置时，才执行下一条指令：
+  //        @$p0.cf add.u32 $r2, $r0, $r1;
   bool has_pred() const { return m_pred != NULL; }
+  //获取谓词。将谓词作为一个 operand_info 对象操作数信息返回。
   operand_info get_pred() const;
+  //???
   bool get_pred_neg() const { return m_neg_pred; }
+  //???
   int get_pred_mod() const { return m_pred_mod; }
+  //返回该指令所在的PTX指令字符串。
   const char *get_source() const { return m_source.c_str(); }
 
   const std::list<int> get_scalar_type() const { return m_scalar_type; }
   const std::list<int> get_options() const { return m_options; }
 
   typedef std::vector<operand_info>::const_iterator const_iterator;
-
+  //m_operands变量（是一个 std::vector 对象），即当前指令的操作数。返回其迭代开头。
   const_iterator op_iter_begin() const { return m_operands.begin(); }
-
+  //m_operands变量（是一个 std::vector 对象），即当前指令的操作数。返回其迭代结尾。
   const_iterator op_iter_end() const { return m_operands.end(); }
-
+  //PTX指令一般有0-4个操作数，外加一个可选的判断标志，一般第一个都是目的地址，后面的是源地址，也可以有两
+  //个目的地址，比如：
+  //    setp.lt.s32 p|q, a, b;          // p = (a < b); q = !(a < b);
+  //也可以只有一个目的地址，比如：
+  //    mad.rn.f64 d, a, b, c;          // d = a * b + c
+  //下面函数获取目的操作数。
   const operand_info &dst() const {
     assert(!m_operands.empty());
     return m_operands[0];
   }
-
+  //一般操作码为 CALL_OP 或 CALLP_OP 时，指令的目的地址为调用函数，这时目的地址是函数的地址 func_addr。
+  //    void ptx_recognizer::set_return() {
+  //      parse_assert((g_opcode == CALL_OP || g_opcode == CALLP_OP),
+  //                  "only call can have return value");
+  //      g_operands.front().set_return();
+  //      g_return_var = g_operands.front();
+  //    }
+  //例如，PTX指令对 CALL 操作码指令格式的例子：
+  //  //direct call to named function, func is a symbol
+  //    call{.uni} (ret-param), func, (param-list);
+  //    call{.uni} func, (param-list);
+  //    call{.uni} func;
+  //其中func_addr可以是 operands[0]，也可以是 operands[1]，但此时没有源操作数。
   const operand_info &func_addr() const {
     assert(!m_operands.empty());
     if (!m_operands[0].is_return_var()) {
@@ -989,12 +1172,12 @@ class ptx_instruction : public warp_inst_t {
       return m_operands[1];
     }
   }
-
+  //同上面的 const operand_info &dst() const{...}。
   operand_info &dst() {
     assert(!m_operands.empty());
     return m_operands[0];
   }
-
+  //根据m_operands的长度，获取至多8个源操作数。
   const operand_info &src1() const {
     assert(m_operands.size() > 1);
     return m_operands[1];
@@ -1029,26 +1212,69 @@ class ptx_instruction : public warp_inst_t {
     assert(m_operands.size() > 8);
     return m_operands[8];
   }
-
+  //传入参数 n，返回操作数列表 m_operands 中的第 n 个操作数。
   const operand_info &operand_lookup(unsigned n) const {
     assert(n < m_operands.size());
     return m_operands[n];
   }
+  //返回是否该条指令有[返回值]操作数。
   bool has_return() const { return m_return_var.is_valid(); }
-
+  //返回存储空间信息。存储空间的信息，如存储空间的类型和该存储空间的Bank的数量。GPGPU-Sim设置的存储空间
+  //的类型有：
+  //  enum _memory_space_t {
+  //    //1. 未定义的空间类型
+  //    undefined_space = 0,
+  //    //2. 寄存器
+  //    reg_space,
+  //    //3. local memory
+  //    local_space,
+  //    //4. shared memory
+  //    shared_space,
+  //    //5. 貌似是 shared static array，其访存的行为与shared memory一致，可以认为其是shared 
+  //    //   memory的一种
+  //    sstarr_space,
+  //    //6. 通用参数存储
+  //    param_space_unclassified,
+  //    //7. 对内核中的所有线程：全局性的，只读的
+  //    param_space_kernel, // global to all threads in a kernel : read-only
+  //    //8. 对某个线程：私有的，可读写的
+  //    param_space_local,  // local to a thread : read-writable
+  //    //9. 常量缓存
+  //    const_space,
+  //    //10.纹理缓存
+  //    tex_space,
+  //    //11.渲染曲面 // render surfaces 
+  //    surf_space,
+  //    //12.全局存储
+  //    global_space,
+  //    //13.通用存储
+  //    generic_space,
+  //    //14.指令存储
+  //    instruction_space
+  //  };
   memory_space_t get_space() const { return m_space_spec; }
   unsigned get_vector() const { return m_vector_spec; }
   unsigned get_atomic() const { return m_atomic_spec; }
 
   int get_wmma_type() const { return m_wmma_type; }
+  //warp中的每一个线程都持有矩阵的一部分。warp中线程加载的fragment的分布是未指定的，并且依赖于目标体系
+  //结构，因此矩阵中fragment的身份也是未指定的并且依赖于对象体系结构。如果基础矩阵的形状、布局和元素类
+  //型匹配，则wmma操作返回的片段可以用作另一个wmma操作的操作数。由于片段布局依赖于体系结构，如果两个函
+  //数链接在一起，但针对不同的链接兼容SM体系结构编译，则使用一个函数中的wmma操作返回的片段作为不同函数
+  //中wmma操作的操作数可能无法按预期工作。注意，将wmma片段传递给具有弱链接的函数是不安全的，因为在链接
+  //时对此类函数的引用可能会解析为不同编译模块中的函数。
+  //获取 wmma 指令的 A、B 两个矩阵的layout，index为 0 时为 A 矩阵，index为 1 时为 B 矩阵。
   int get_wmma_layout(int index) const {
     return m_wmma_layout[index];  // 0->Matrix D,1->Matrix C
   }
+  //指令字符串只有一个操作数时，直接用get_type()获取即可。
   int get_type() const {
     assert(!m_scalar_type.empty());
     return m_scalar_type.front();
   }
-
+  //例如指令：cvt.frnd2{.relu}.f16x2.f32  d, a, b; 是将FP32类型的源操作数a和b转换为两个FP16类型，并
+  //将a转换成的数据放到高16位，将b转换成的数据放到低16位，打包成一个数据放到目的地址d。因此，需要获取指
+  //令字符串的第二个操作类型，使用get_type2()来获取。
   int get_type2() const {
     assert(m_scalar_type.size() == 2);
     return m_scalar_type.back();
@@ -1061,13 +1287,27 @@ class ptx_instruction : public warp_inst_t {
   }
   basic_block_t *get_bb() { return m_basic_block; }
   void set_m_instr_mem_index(unsigned index) { m_instr_mem_index = index; }
+  //设置当前指令的 PC 值，指令处理过程中，为每条指令分配一个唯一的 PC 并作为参数传入该函数，该函数设置
+  //当前指令的 PC 值：m_PC = PC。
   void set_PC(addr_t PC) { m_PC = PC; }
+  //获取当前指令的 PC 值，返回 m_PC。
   addr_t get_PC() const { return m_PC; }
 
   unsigned get_m_instr_mem_index() { return m_instr_mem_index; }
   unsigned get_cmpop() const { return m_compare_op; }
+  //获取该条指令的标签，返回的标签是一个 symbol 对象。
   const symbol *get_label() const { return m_label; }
+
+  //is_label() 用于判断指令pI是否含有标签。label即为例如PTX指令块中的$L__BB0_6等：
+  //  01.$L__BB0_6: <---- label
+  //  02.  .pragma "nounroll";
+  //  03.  ld.global.u32 %r28, [%rd32];
+  //  04.  ...
+  //  ...  ...
+  //  12.  @%p5 bra $L__BB0_6; <---- label = $L__BB0_6
   bool is_label() const {
+    //m_label 是一个 symbol 类的对象，储存了该条指令的标签，例如上述的 $L__BB0_6。如果 m_label 不为
+    //空则代表该条指令是含有标签的。
     if (m_label) {
       assert(m_opcode == -1);
       return true;
@@ -1139,8 +1379,12 @@ class ptx_instruction : public warp_inst_t {
   bool m_neg_pred;
   int m_pred_mod;
   int m_opcode;
+  //m_label 是一个 symbol 类的对象，储存了该条指令的标签，例如上述的 $L__BB0_6。如果 m_label 不为空
+  //则代表该条指令是含有标签的。
   const symbol *m_label;
+  //该条指令的操作数列表 m_operands。
   std::vector<operand_info> m_operands;
+  //指令的[返回值]操作数。
   operand_info m_return_var;
 
   std::list<int> m_options;
@@ -1246,8 +1490,28 @@ class param_info {
   memory_space_t m_ptr_space;
 };
 
+/*
+单独的PTX指令在PTX函数中找到，这些函数要么是内核入口点，要么是可以在GPU上调用的子程序。每个PTX函数都有
+一个 function_info 对象，例如下述 .ptx 文件中：
+    .visible .entry _Z6MatMulPiS_S_i(
+      .param .u64 _Z6MatMulPiS_S_i_param_0,
+      .param .u64 _Z6MatMulPiS_S_i_param_1,
+      .param .u64 _Z6MatMulPiS_S_i_param_2,
+      .param .u32 _Z6MatMulPiS_S_i_param_3
+      )
+    {...}
+function_info 对象：
+    1. function_info 包含一个可以进行功能模拟的静态PTX指令（ptx_instruction）列表。
+    2. 对于内核入口点，将每个内核参数存储在一个映射 m_ptx_kernel_param_info 中；但是，对于OpenCL应用
+    程序来说，这可能并不总是这样的。在OpenCL中，相关的常量内存空间可以通过两种方式分配。它可以在声明它
+    的ptx文件中显式初始化，或者使用主机上的clCreateBuffer来分配它。在后面这种情况下，.ptx文件将包含一
+    个参数的全局声明，但它将有一个未知的数组大小。因此，该符号的地址将不会被设置，需要在执行PTX之前在
+    function_info::add_param_data(...) 函数中设置。在这种情况下，内核参数的地址被存储在function_info
+    对象中的一个符号表中。
+*/
 class function_info {
  public:
+  //构造函数
   function_info(int entry_point, gpgpu_context *ctx);
   const ptx_version &get_ptx_version() const {
     return m_symtab->get_ptx_version();
@@ -1348,7 +1612,37 @@ class function_info {
     assert(m_kernel_info.maxthreads == maxnt_id);
     return &m_kernel_info;
   }
-
+  //设置 kernel 的信息，m_kernel_info包括：Registers/shmem/etc. used (from ptxas -v), loaded 
+  //from ___.ptxinfo along with ___.ptx。例如，cuda_codes/myTest/文件夹下面的PTX文件：
+  //    .version 7.5
+  //    .target sm_52
+  //    .address_size 64
+  //    .visible .entry _Z6MatMulPiS_S_i(
+  //        .param .u64 _Z6MatMulPiS_S_i_param_0,
+  //        .param .u64 _Z6MatMulPiS_S_i_param_1,
+  //        .param .u64 _Z6MatMulPiS_S_i_param_2,
+  //        .param .u32 _Z6MatMulPiS_S_i_param_3
+  //    )
+  //    ......
+  //使用 ptxas 后，PTXAS文件：
+  //    ptxas info    : 0 bytes gmem
+  //    ptxas info    : Compiling entry function '_Z6MatMulPiS_S_i' for 'sm_52'
+  //    ptxas info    : Function properties for _Z6MatMulPiS_S_i
+  //        0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  //    ptxas info    : Used 32 registers, 348 bytes cmem[0]
+  //gpgpu_ptx_sim_info的定义：
+  //    struct gpgpu_ptx_sim_info {
+  //        // Holds properties of the kernel (Kernel's resource use).
+  //        // These will be set to zero if a ptxinfo file is not present.
+  //        int lmem;
+  //        int smem;
+  //        int cmem;
+  //        int gmem;
+  //        int regs;
+  //        unsigned maxthreads;
+  //        unsigned ptx_version;
+  //        unsigned sm_target;
+  //    };
   virtual const void set_kernel_info(const struct gpgpu_ptx_sim_info &info) {
     m_kernel_info = info;
     m_kernel_info.ptx_version = 10 * get_ptx_version().ver();
@@ -1361,7 +1655,9 @@ class function_info {
   unsigned local_mem_framesize() const { return m_local_mem_framesize; }
   void set_framesize(unsigned sz) { m_local_mem_framesize = sz; }
   bool is_entry_point() const { return m_entry_point; }
+  //pdom_done是检查pdom是否完成的标志，返回这个标志
   bool is_pdom_set() const { return pdom_done; }  // return pdom flag
+  //一旦检查pdom完成，设置标志pdom_done = true。
   void set_pdom() { pdom_done = true; }           // set pdom flag
 
   void add_config_param(size_t size, unsigned alignment) {
@@ -1397,6 +1693,7 @@ class function_info {
   bool m_entry_point;
   bool m_extern;
   bool m_assembled;
+  //pdom_done是检查pdom是否完成的标志
   bool pdom_done;  // flag to check whether pdom is completed or not
   std::string m_name;
   ptx_instruction **m_instr_mem;
@@ -1420,6 +1717,7 @@ class function_info {
   symbol_table *m_symtab;
 
   // parameter size for device kernels
+  //设备端内核函数的参数大小。
   int m_args_aligned_size;
 
   addr_t m_n;  // offset in m_instr_mem (used in do_pdom)

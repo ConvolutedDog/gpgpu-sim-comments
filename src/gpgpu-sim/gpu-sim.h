@@ -29,6 +29,12 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+/*
+cuda-sim：执行N虚拟ChannelC或OpenCL编译器生成的PTX内核的功能模拟器。
+gpgpu-sim：模拟GPU（或其他许多核心加速器架构）计时行为的性能模拟器。
+intersim：采用Bill Dally的BookSim的互连网络模拟器。
+*/
+
 #ifndef GPU_SIM_H
 #define GPU_SIM_H
 
@@ -43,7 +49,18 @@
 #include "gpu-cache.h"
 #include "shader.h"
 
-// constants for statistics printouts
+/* 
+constants for statistics printouts
+性能信息输出的常量：
+1. GPU_RSTAT_SHD_INFO：GPU着色器信息
+2. GPU_RSTAT_BW_STAT：GPU带宽统计
+3. GPU_RSTAT_WARP_DIS：GPU线程组分布
+4. GPU_RSTAT_DWF_MAP：GPU指令流地图
+5. GPU_RSTAT_L1MISS：GPU L1缓存未命中统计
+6. GPU_RSTAT_PDOM：GPU指令流活动统计
+7. GPU_RSTAT_SCHED：GPU调度统计
+8. GPU_MEMLATSTAT_MC：GPU存储器延迟统计（主存储器）
+*/
 #define GPU_RSTAT_SHD_INFO 0x1
 #define GPU_RSTAT_BW_STAT 0x2
 #define GPU_RSTAT_WARP_DIS 0x4
@@ -53,14 +70,28 @@
 #define GPU_RSTAT_SCHED 0x40
 #define GPU_MEMLATSTAT_MC 0x2
 
-// constants for configuring merging of coalesced scatter-gather requests
+/*
+constants for configuring merging of coalesced scatter-gather requests
+用于配置分散-收集请求的合并的常量：
+TEX_MSHR_MERGE：纹理MSHR合并
+CONST_MSHR_MERGE：常量MSHR合并
+GLOBAL_MSHR_MERGE：全局MSHR合并
+*/
 #define TEX_MSHR_MERGE 0x4
 #define CONST_MSHR_MERGE 0x2
 #define GLOBAL_MSHR_MERGE 0x1
 
-// clock constants
+/*
+clock constants
+时钟频率。
+*/
 #define MhZ *1000000
 
+/*
+CREATELOG：创建日志，指将系统运行期间发生的事件记录到日志文件中。
+SAMPLELOG：样例日志，指在系统中已经存在的一些日志文件，可以用来参考和学习。
+DUMPLOG：转储日志，指将日志文件从系统中转储出来，以便进行分析和备份。
+*/
 #define CREATELOG 111
 #define SAMPLELOG 222
 #define DUMPLOG 333
@@ -95,6 +126,7 @@ enum hw_perf_t {
 };
 
 struct power_config {
+  //power_config()函数已经被正确调用，并且m_valid变量被设置为true，表示配置文件有效。
   power_config() { m_valid = true; }
   void init() {
     // initialize file name if it is not set
@@ -138,6 +170,27 @@ struct power_config {
   }
   void reg_options(class OptionParser *opp);
 
+  /*
+  g_power_config_name：用于指定当前配置的名称。
+  m_valid：用于标记当前配置是否有效。
+  g_power_simulation_enabled：用于标记是否启用功耗仿真。
+  g_power_trace_enabled：用于标记是否启用功耗跟踪。
+  g_steady_power_levels_enabled：用于标记是否启用稳定功耗水平。
+  g_power_per_cycle_dump：用于标记是否每周期输出功耗。
+  g_power_simulator_debug：用于标记是否启用功耗仿真调试功能。
+  g_power_filename：用于指定功耗仿真结果的文件名。
+  g_power_trace_filename：用于指定功耗跟踪结果的文件名。
+  g_metric_trace_filename：用于指定指标跟踪结果的文件名。
+  g_steady_state_tracking_filename：用于指定稳态跟踪结果的文件名。
+  g_power_trace_zlevel：用于指定功耗跟踪结果的压缩级别。
+  gpu_steady_state_definition：用于指定稳态跟踪的定义。
+  gpu_steady_power_deviation：用于指定稳定功耗水平偏差的最大值。
+  gpu_steady_min_period：用于指定稳态跟踪的最小周期。
+  g_use_nonlinear_model：用于标记是否使用非线性模型。
+  gpu_nonlinear_model_config：用于指定非线性模型配置。
+  gpu_idle_core_power：用于指定空闲核心的功耗。
+  gpu_min_inc_per_active_sm：用于指定每个活动SM的最小功耗增量。
+  */
   char *g_power_config_name;
 
   bool m_valid;
@@ -259,6 +312,19 @@ class memory_config {
     assert((nbk % m_n_sub_partition_per_memory_channel == 0) &&
            "Number of DRAM banks must be a perfect multiple of memory sub "
            "partition");
+    //gpgpu_n_mem为配置中的内存控制器（DRAM Channel）数量，定义为：
+    //  option_parser_register(
+    //      opp, "-gpgpu_n_mem", OPT_UINT32, &m_n_mem,
+    //      "number of memory modules (e.g. memory controllers) in gpu", "8");
+    //内存控制器接收从高速总线上发来的访存指令，转换为DDR总线上的DDR指令，完成访存动作。
+    //在V100配置中，有32个内存控制器（DRAM Channel），同时每个内存控制器分为了两个子分区，因此，
+    //m_n_sub_partition_per_memory_channel为2，定义为：
+    //  option_parser_register(opp, "-gpgpu_n_sub_partition_per_mchannel", OPT_UINT32,
+    //                         &m_n_sub_partition_per_memory_channel,
+    //                         "number of memory subpartition in each memory module",
+    //                         "1");
+    //而m_n_mem_sub_partition = m_n_mem * m_n_sub_partition_per_memory_channel=64，代表全
+    //部内存子分区的总数。
     m_n_mem_sub_partition = m_n_mem * m_n_sub_partition_per_memory_channel;
     fprintf(stdout, "Total number of memory sub partition = %u\n",
             m_n_mem_sub_partition);
@@ -514,8 +580,15 @@ class watchpoint_event {
   const ptx_instruction *m_inst;
 };
 
+/*
+实现GPU功能模拟器的顶层类。它包含功能模拟器的配置（gpgpu_functional_sim_config），并持有实现全局/纹
+理内存空间的实际缓冲器（memory_space类的实例）。它有一组成员函数，提供对模拟的GPU内存空间的管理（ma-
+lloc, memcpy, texture-bindin, ...）。这些成员函数被CUDA/OpenCL的API实现所调用。gpgpu_sim类（顶级
+的GPU时序仿真模型）是由该类派生的。
+*/
 class gpgpu_sim : public gpgpu_t {
  public:
+  //构造函数。
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
 
   void set_prop(struct cudaDeviceProp *prop);
@@ -545,15 +618,22 @@ class gpgpu_sim : public gpgpu_t {
   void inc_completed_cta() { gpu_completed_cta++; }
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
-
+  //获取每个SIMT Core（也称为Shader Core）的共享存储大小。由GPGPU-Sim的-gpgpu_shmem_size选项配置。
   int shared_mem_size() const;
+  //获取每个线程块或CTA的共享内存大小（默认48KB）。由GPGPU-Sim的-gpgpu_shmem_per_block选项配置。
   int shared_mem_per_block() const;
   int compute_capability_major() const;
   int compute_capability_minor() const;
+  //获取每个Shader Core的寄存器数。并发CTA的限制数量。由GPGPU-Sim的-gpgpu_shader_registers选项配置。
   int num_registers_per_core() const;
+  //获取每个CTA的最大寄存器数。由GPGPU-Sim的-gpgpu_registers_per_block选项配置。
   int num_registers_per_block() const;
+  //获取一个warp有多少线程数。由GPGPU-Sim的-gpgpu_shader_core_pipeline的第二个选项配置。
+  //选项-gpgpu_shader_core_pipeline的参数分别是：<每个SM最大可支配线程数>:<定义一个warp有多少线程>。
   int wrp_size() const;
+  //获取以MHz为单位的时钟域频率的<Core Clock>。由GPGPU-Sim的-gpgpu_clock_domains的第一个选项配置。
   int shader_clock() const;
+  //获取Shader Core中并发cta的最大数量。由GPGPU-Sim的-gpgpu_shader_cta选项配置。
   int max_cta_per_core() const;
   int get_max_cta(const kernel_info_t &k) const;
   const struct cudaDeviceProp *get_prop() const;
@@ -620,6 +700,7 @@ class gpgpu_sim : public gpgpu_t {
 
  protected:
   ///// data /////
+  //m_cluster是SIMT Core集群的类。
   class simt_core_cluster **m_cluster;
   class memory_partition_unit **m_memory_partition_unit;
   class memory_sub_partition **m_memory_sub_partition;
@@ -632,18 +713,22 @@ class gpgpu_sim : public gpgpu_t {
   // count.
   unsigned long long m_total_cta_launched;
   unsigned long long gpu_tot_issued_cta;
+  //已经完成的CTA的总数。
   unsigned gpu_completed_cta;
-
+  //上一次最后发射的集群。
   unsigned m_last_cluster_issue;
   float *average_pipeline_duty_cycle;
+  //SIMT Core集群中的活跃SM的数量。
   float *active_sms;
   // time of next rising edge
+  //下一个上升沿的时刻。
   double core_time;
   double icnt_time;
   double dram_time;
   double l2_time;
 
   // debug
+  //检测到GPU存在死锁。
   bool gpu_deadlock;
 
   //// configuration parameters ////
@@ -678,7 +763,9 @@ class gpgpu_sim : public gpgpu_t {
   virtual void createSIMTCluster() = 0;
 
  public:
+  //执行当前阶段的指令的总数，比如将各个warp的相加。
   unsigned long long gpu_sim_insn;
+  //执行当前阶段之前的所有前绪指令的总数。
   unsigned long long gpu_tot_sim_insn;
   unsigned long long gpu_sim_insn_last_update;
   unsigned gpu_sim_insn_last_update_sid;

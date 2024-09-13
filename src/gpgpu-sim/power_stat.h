@@ -46,11 +46,14 @@ typedef enum _stat_idx {
 struct shader_core_power_stats_pod {
   // [CURRENT_STAT_IDX] = CURRENT_STAT_IDX stat, [PREV_STAT_IDX] = last reading
   float *m_pipeline_duty_cycle[NUM_STAT_IDX];
+  //m_num_decoded_insn是SM上解码后的指令数。NUM_STAT_IDX=SM总数。
   unsigned *m_num_decoded_insn[NUM_STAT_IDX];  // number of instructions
                                                // committed by this shader core
+  //SM上解码后的FP指令数。
   unsigned
       *m_num_FPdecoded_insn[NUM_STAT_IDX];  // number of instructions committed
                                             // by this shader core
+  //SM上解码后的INT指令数。
   unsigned
       *m_num_INTdecoded_insn[NUM_STAT_IDX];  // number of instructions committed
                                              // by this shader core

@@ -55,6 +55,7 @@ frfcfs_scheduler::frfcfs_scheduler(const memory_config *config, dram_t *dm,
   }
   if (m_config->seperate_write_queue_enabled) {
     m_write_queue = new std::list<dram_req_t *>[m_config->nbk];
+    //map的key为bank的行号，value为list的迭代器。
     m_write_bins = new std::map<
         unsigned, std::list<std::list<dram_req_t *>::iterator> >[m_config->nbk];
     m_last_write_row =
@@ -69,17 +70,27 @@ frfcfs_scheduler::frfcfs_scheduler(const memory_config *config, dram_t *dm,
   m_mode = READ_MODE;
 }
 
+/*
+调度器新增一个请求。依据请求是读数据还是写数据，分别将其加入到它对应Bank的读取队列或写入队列中。
+*/
 void frfcfs_scheduler::add_req(dram_req_t *req) {
+  //dram_seperate_write_queue_enable在V100中配置为1。
   if (m_config->seperate_write_queue_enabled && req->data->is_write()) {
+    //这里是写数据。
     assert(m_num_write_pending < m_config->gpgpu_frfcfs_dram_write_queue_size);
+    //挂起的写入数据个数加1。
     m_num_write_pending++;
+    //将请求加入到req->bk指示的Bank的写入队列的最前端。
     m_write_queue[req->bk].push_front(req);
     std::list<dram_req_t *>::iterator ptr = m_write_queue[req->bk].begin();
     m_write_bins[req->bk][req->row].push_front(ptr);  // newest reqs to the
                                                       // front
   } else {
+    //这里是读数据。
     assert(m_num_pending < m_config->gpgpu_frfcfs_dram_sched_queue_size);
+    //挂起的写入数据个数加1。
     m_num_pending++;
+    //将请求加入到req->bk指示的Bank的读取队列的最前端。
     m_queue[req->bk].push_front(req);
     std::list<dram_req_t *>::iterator ptr = m_queue[req->bk].begin();
     m_bins[req->bk][req->row].push_front(ptr);  // newest reqs to the front
@@ -106,6 +117,9 @@ void frfcfs_scheduler::data_collection(unsigned int bank) {
   m_stats->num_activates[m_dram->id][bank]++;
 }
 
+/*
+调度器调度。
+*/
 dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
   // row
   bool rowhit = true;
@@ -204,10 +218,18 @@ void frfcfs_scheduler::print(FILE *fp) {
   }
 }
 
+/*
+FR-FCFS调度器进行调度。主要工作是，将memory request queue中的请求加入到调度器中，
+然后从调度器中取出一个请求，并依据请求是读数据还是写数据，分别将其加入到它对应Bank
+的读取队列或写入队列中。
+*/
 void dram_t::scheduler_frfcfs() {
   unsigned mrq_latency;
+  //调度器。
   frfcfs_scheduler *sched = m_frfcfs_scheduler;
+  //mrqq为memory request queue.
   while (!mrqq->empty()) {
+    //如果memory request queue非空，则需要将其中的请求加入到调度器中。
     dram_req_t *req = mrqq->pop();
 
     // Power stats
@@ -223,12 +245,15 @@ void dram_t::scheduler_frfcfs() {
 
     req->data->set_status(IN_PARTITION_MC_INPUT_QUEUE,
                           m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    //调度器新增一个请求，依据请求是读数据还是写数据，分别将其加入到它对应Bank的
+    //读取队列或写入队列中。
     sched->add_req(req);
   }
 
   dram_req_t *req;
   unsigned i;
   for (i = 0; i < m_config->nbk; i++) {
+    //bank轮询。
     unsigned b = (i + prio) % m_config->nbk;
     if (!bk[b]->mrq) {
       req = sched->schedule(b, bk[b]->curr_row);

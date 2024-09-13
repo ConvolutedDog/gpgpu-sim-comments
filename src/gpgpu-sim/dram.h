@@ -54,11 +54,15 @@ class dram_req_t {
  public:
   dram_req_t(class mem_fetch *data, unsigned banks,
              unsigned dram_bnk_indexing_policy, class gpgpu_sim *gpu);
-
+  //行号。
   unsigned int row;
+  //列号。
   unsigned int col;
+  //bank号。
   unsigned int bk;
+  //请求的数据总字节数。
   unsigned int nbytes;
+  //请求的已传输的数据总字节数，当txbytes>=nbytes代表传输完成。
   unsigned int txbytes;
   unsigned int dqbytes;
   unsigned int age;
@@ -71,29 +75,51 @@ class dram_req_t {
 };
 
 struct bankgrp_t {
+  //column to column delay between accesses to different bank groups.
   unsigned int CCDLc;
+  //read to precharge delay between accesses to different bank groups.
   unsigned int RTPLc;
 };
 
 struct bank_t {
+  //row to column delay - time required to activate a row before a read.
+  //RCD为Row Command Delay的缩写，是一个Row被Active之后，数据从DRAM cell到Sense Amp的拍数。
   unsigned int RCDc;
+  //row to column delay for a write command - time required to activate a row before a 
+  //write.
   unsigned int RCDWRc;
+  //time needed to activate row.
+  //RAS（RAS Active Time，又可以称为：Active to Prechage Delay）：预充电至内存行激活的最短
+  //周期。
   unsigned int RASc;
+  //row precharge ie. deactivate row.
+  //RPc（Row Precharge Time，又可以称为：Precharge to Active）：内存行地址控制器预充电时间，
+  //一般单位为单位时间周期。
+  //在读取 cell 行（之后也称作单元行）前，需要把每根位线都 precharge（预充电）到电容电压/供电
+  //电压最大值的一半，如果供电电压是 3 V，那么就预充电到 1.5 V。预充电完毕后打开字线，单元行中
+  //每个 cell 电容或是向位线放电，或是由位线充电。放电者位线电压上升一点，充电者位线电压下降一
+  //点。放大器可以捕捉位线上的电压波动，继而在本地还原、暂存对应 cell 电压。
   unsigned int RPc;
+  //row cycle time ie. precharge current, then activate different row.
+  //RCc（Row Cycle Time）：定义了同一bank两次行激活命令所间隔的最小时间，或者说是一个bank中完
+  //成一次行操作周期（Row Cycle）的时间。
   unsigned int RCc;
+  //time to switch from write to precharge in the same bank.
   unsigned int WTPc;  // write to precharge
+  //time to switch from read to precharge in the same bank.
+  //RTPc = m_config->BL / m_config->data_command_freq_ratio;
   unsigned int RTPc;  // read to precharge
 
   unsigned char rw;     // is the bank reading or writing?
   unsigned char state;  // is the bank active or idle?
   unsigned int curr_row;
-
+  //对当前bank的读请求。
   dram_req_t *mrq;
 
   unsigned int n_access;
   unsigned int n_writes;
   unsigned int n_idle;
-
+  //bank group index.
   unsigned int bkgrpindex;
 };
 
@@ -109,8 +135,15 @@ enum bank_grp_bits_position { HIGHER_BITS = 0, LOWER_BITS };
 class mem_fetch;
 class memory_config;
 
+/*
+dram_t是隶属于单个memory_partition_unit的DRAM模型，每个memory_partition_unit有一个
+dram_t模型。
+参考: https://zhuanlan.zhihu.com/p/561501585
+*/
 class dram_t {
  public:
+  //dram_t的构造函数。每个memory_partition_unit有一个dram_t模型，dram_t是隶属于单个
+  //memory_partition_unit的DRAM模型。
   dram_t(unsigned int parition_id, const memory_config *config,
          class memory_stats_t *stats, class memory_partition_unit *mp,
          class gpgpu_sim *gpu);
@@ -151,15 +184,18 @@ class dram_t {
   unsigned get_bankgrp_number(unsigned i);
 
   void scheduler_fifo();
+  //FR-FCFS调度器进行调度。主要工作是，将memory request queue中的请求加入到调度器中，
+  //然后从调度器中取出一个请求，并依据请求是读数据还是写数据，分别将其加入到它对应Bank
+  //的读取队列或写入队列中。
   void scheduler_frfcfs();
 
   bool issue_col_command(int j);
   bool issue_row_command(int j);
 
-  unsigned int RRDc;
-  unsigned int CCDc;
-  unsigned int RTWc;  // read to write penalty applies across banks
-  unsigned int WTRc;  // write to read penalty applies across banks
+  unsigned int RRDc;  // Row to Row Delay
+  unsigned int CCDc;  // Column to Column Delay
+  unsigned int RTWc;  // read to write penalty applies across banks, time to switch from read to write
+  unsigned int WTRc;  // write to read penalty applies across banks, time to switch from write to read
 
   unsigned char
       rw;  // was last request a read or write? (important for RTW, WTR)
@@ -167,6 +203,7 @@ class dram_t {
   unsigned int pending_writes;
 
   fifo_pipeline<dram_req_t> *rwq;
+  //memory request queue.
   fifo_pipeline<dram_req_t> *mrqq;
   // buffer to hold packets when DRAM processing is over
   // should be filled with dram clock and popped with l2or icnt clock

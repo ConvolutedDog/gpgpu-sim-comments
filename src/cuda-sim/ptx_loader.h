@@ -26,6 +26,10 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+/*
+ptx_loader.h/.cc 包含用于加载和解析以及打印ptx和ptxinfo文件的函数。
+*/
+
 #ifndef PTX_LOADER_H_INCLUDED
 #define PTX_LOADER_H_INCLUDED
 #include <string>

@@ -37,57 +37,98 @@
 #include "local_interconnect.h"
 #include "mem_fetch.h"
 
+/*
+Xbar路由器。子网络构造函数。
+*/
 xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
                          unsigned n_shader, unsigned n_mem,
                          const struct inct_config& m_localinct_config) {
+  //路由器ID。
   m_id = router_id;
+  //REQ_NET或REPLY_NET，子网络个数在V100中配置为2，0号自网络负责REQ_NET，1号子
+  //网络负责REPLY_NET。
   router_type = m_type;
+  //内存子分区的个数。
   _n_mem = n_mem;
+  //SM总数量。
   _n_shader = n_shader;
+  //总节点数=SM总数量+内存子分区的个数。
   total_nodes = n_shader + n_mem;
+  //是否打印详细信息的开关选项。
   verbose = m_localinct_config.verbose;
   grant_cycles = m_localinct_config.grant_cycles;
   grant_cycles_count = m_localinct_config.grant_cycles;
   in_buffers.resize(total_nodes);
   out_buffers.resize(total_nodes);
   next_node.resize(total_nodes, 0);
+  //in_buffers[deviceID]缓冲区最大可容纳数据包个数。
   in_buffer_limit = m_localinct_config.in_buffer_limit;
+  //out_buffers[deviceID]缓冲区最大可容纳数据包个数。
   out_buffer_limit = m_localinct_config.out_buffer_limit;
+  //仲裁类型，icnt_arbiter_algo，在V100中配置为1=iSLIP算法。
   arbit_type = m_localinct_config.arbiter_algo;
   next_node_id = 0;
   if (m_type == REQ_NET) {
+    //如果是REQ_NET（0号子网络），数据包由SM转发至内存子分区，则：
+    //    激活的输入缓冲区个数为SM数量。
+    //    激活的输出缓冲区个数为内存子分区数量。
     active_in_buffers = n_shader;
     active_out_buffers = n_mem;
   } else if (m_type == REPLY_NET) {
+    //如果是REPLY_NET（1号子网络），数据包由内存子分区转发至SM，则：
+    //    激活的输入缓冲区个数为内存子分区数量。
+    //    激活的输出缓冲区个数为SM数量。
     active_in_buffers = n_mem;
     active_out_buffers = n_shader;
   }
 
+  //互连子网络执行路由的周期总数，无论这一拍有没有路由数据包。
   cycles = 0;
+  //conflicts是在整个程序执行期间，数据包的目的设备号有冲突的次数，比如第0号和第1号设
+  //备都有数据包发送到第25号设备，那么算冲突一次。
   conflicts = 0;
+  //某一个节点的输出缓冲区满了就增加一次，因此统计的是在整个程序执行期间，输出缓冲区满
+  //了的总次数。注意两个节点在同一拍满了算两次。
   out_buffer_full = 0;
+  //某一个节点的输入缓冲区满了就增加一次，因此统计的是在整个程序执行期间，输入缓冲区满
+  //了的总次数。注意两个节点在同一拍满了算两次。
   in_buffer_full = 0;
   out_buffer_util = 0;
   in_buffer_util = 0;
+  //整个程序执行周期内，进入子网络的数据包的总个数。
   packets_num = 0;
+  //conflicts_util是在[互连子网络的输入buffer中有数据包的周期数]期间，即互连子网络有
+  //效利用期间，数据包的目的设备号有冲突的次数，比如第0号和第1号设备都有数据包发送到第
+  //25号设备，那么算冲突一次。
   conflicts_util = 0;
+  //cycles_util是互连子网络的输入buffer中有数据包的周期数，即互连子网络有效利用的周期
+  //数，后面用于统计。
   cycles_util = 0;
+  //reqs_util是在[互连子网络的输入buffer中有数据包的周期数]期间，即互连子网络有效利用
+  //期间，互连子网络路由的数据包的总数。
   reqs_util = 0;
 }
 
 xbar_router::~xbar_router() {}
 
+/*
+将数据包推入子网络。
+*/
 void xbar_router::Push(unsigned input_deviceID, unsigned output_deviceID,
                        void* data, unsigned int size) {
   assert(input_deviceID < total_nodes);
   in_buffers[input_deviceID].push(Packet(data, output_deviceID));
+  //整个程序执行周期内，进入子网络的数据包的总个数。
   packets_num++;
 }
 
+/*
+将数据包从子网络弹出。
+*/
 void* xbar_router::Pop(unsigned ouput_deviceID) {
   assert(ouput_deviceID < total_nodes);
   void* data = NULL;
-
+  //子网络输出缓冲区不为空时，弹出front数据包。
   if (!out_buffers[ouput_deviceID].empty()) {
     data = out_buffers[ouput_deviceID].front().data;
     out_buffers[ouput_deviceID].pop();
@@ -96,22 +137,38 @@ void* xbar_router::Pop(unsigned ouput_deviceID) {
   return data;
 }
 
+/*
+判断当前子网络是否有足够的输入缓冲区能够容纳size大小的新数据包。
+*/
 bool xbar_router::Has_Buffer_In(unsigned input_deviceID, unsigned size,
                                 bool update_counter) {
   assert(input_deviceID < total_nodes);
 
+  //in_buffers[input_deviceID].size()大小是当前已经在输入缓冲区里的数据包数量，
+  //如果该数量 + size > 输入缓冲区的大小限制，则代表不能容纳新的size大小的数据包。
   bool has_buffer =
       (in_buffers[input_deviceID].size() + size <= in_buffer_limit);
+  //某一个节点的输入缓冲区满了就增加一次，因此统计的是在整个程序执行期间，输入缓冲
+  //区满了的总次数。注意两个节点在同一拍满了算两次。
   if (update_counter && !has_buffer) in_buffer_full++;
 
   return has_buffer;
 }
 
+/*
+判断当前子网络是否有足够的输出缓冲区能够容纳size大小的新数据包。
+*/
 bool xbar_router::Has_Buffer_Out(unsigned output_deviceID, unsigned size) {
+  //out_buffers[output_deviceID].size()大小是当前已经在输出缓冲区里的数据包数量，
+  //如果该数量 + size > 输出缓冲区的大小限制，则代表不能容纳新的size大小的数据包。
   return (out_buffers[output_deviceID].size() + size <= out_buffer_limit);
 }
 
+/*
+执行路由一拍。
+*/
 void xbar_router::Advance() {
+  //仲裁类型，icnt_arbiter_algo，在V100中配置为1=iSLIP算法。
   if (arbit_type == NAIVE_RR)
     RR_Advance();
   else if (arbit_type == iSLIP)
@@ -176,14 +233,20 @@ void xbar_router::RR_Advance() {
 // McKeown, Nick. "The iSLIP scheduling algorithm for input-queued switches."
 // IEEE/ACM transactions on networking 2 (1999): 188-201.
 // https://www.cs.rutgers.edu/~sn624/552-F18/papers/islip.pdf
+/*
+执行路由一拍。
+*/
 void xbar_router::iSLIP_Advance() {
   vector<unsigned> node_tmp;
   bool active = false;
 
   unsigned conflict_sub = 0;
+  //reqs是当前拍，互连子网络路由的数据包的总数。
   unsigned reqs = 0;
 
   // calcaulte how many conflicts are there for stats
+  //这里是遍历所有节点，看它们的输入buffer中，是否有相同的输出目的设备output_deviceID，
+  //如果存在则说明有冲突。
   for (unsigned i = 0; i < total_nodes; ++i) {
     if (!in_buffers[i].empty()) {
       Packet _packet_tmp = in_buffers[i].front();
@@ -200,17 +263,30 @@ void xbar_router::iSLIP_Advance() {
     }
   }
 
+  //conflicts是在整个程序执行期间，数据包的目的设备号有冲突的次数，比如第0号和第1号设备
+  //都有数据包发送到第25号设备，那么算冲突一次。
   conflicts += conflict_sub;
   if (active) {
+    //conflicts_util是在[互连子网络的输入buffer中有数据包的周期数]期间，即互连子网络有
+    //效利用期间，数据包的目的设备号有冲突的次数，比如第0号和第1号设备都有数据包发送到第
+    //25号设备，那么算冲突一次。
     conflicts_util += conflict_sub;
+    //cycles_util是互连子网络的输入buffer中有数据包的周期数，即互连子网络有效利用的周期
+    //数，后面用于统计。
     cycles_util++;
   }
   // do iSLIP
+  //这里遍历所有节点，为这些所有节点的输出缓冲区选择应路由的数据包。
   for (unsigned i = 0; i < total_nodes; ++i) {
+    //如果第i号节点的输出缓冲区还可以接收新的数据包。
     if (Has_Buffer_Out(i, 1)) {
+      //对所有节点遍历，看这些节点中哪些节点的输入缓冲区里有需要路由到第i号节点的数据包。
       for (unsigned j = 0; j < total_nodes; ++j) {
+        //这里是轮盘调度策略。next_node[i]在第i个输出缓冲区接收一个新数据包时，向下旋转
+        //一次。
         unsigned node_id = (j + next_node[i]) % total_nodes;
-
+        //下面判断第(j + next_node[i])% total_nodes个节点的输入缓冲里是否有目的节点为
+        //i的数据包，如果有的话，则将其从输入缓冲里弹出，并压入第i号节点的输出缓冲区。
         if (!in_buffers[node_id].empty()) {
           Packet _packet = in_buffers[node_id].front();
           if (_packet.output_deviceID == i) {
@@ -233,23 +309,29 @@ void xbar_router::iSLIP_Advance() {
                 }
               }
             }
-
+            //reqs是当前拍，互连子网络路由的数据包的总数。
             reqs++;
             break;
           }
         }
       }
     } else
+      //某一个节点的输出缓冲区满了就增加一次，因此统计的是在整个程序执行期间，输出缓冲
+      //区满了的总次数。注意两个节点在同一拍满了算两次。
       out_buffer_full++;
   }
 
   if (active) {
+    //reqs是当前拍，互连子网络路由的数据包的总数。
+    //reqs_util是在[互连子网络的输入buffer中有数据包的周期数]期间，即互连子网络有效利
+    //用期间，互连子网络路由的数据包的总数。
     reqs_util += reqs;
   }
 
   if (verbose)
     printf("%d : cycle %llu : grant_cycles = %d\n", m_id, cycles, grant_cycles);
 
+  //在V100配置中，grant_cycles_count始终等于1。
   if (active && grant_cycles_count == 1)
     grant_cycles_count = grant_cycles;
   else if (active)
@@ -266,9 +348,13 @@ void xbar_router::iSLIP_Advance() {
     out_buffer_util += out_buffers[i].size();
   }
 
+  //互连子网络执行路由的周期总数，无论这一拍有没有路由数据包。
   cycles++;
 }
 
+/*
+当所有输入缓冲和输出缓冲都没有数据包时，认为当前子网络处于空闲状态，反之则是Busy状态。
+*/
 bool xbar_router::Busy() const {
   for (unsigned i = 0; i < total_nodes; ++i) {
     if (!in_buffers[i].empty()) return true;
@@ -282,8 +368,14 @@ bool xbar_router::Busy() const {
 /////////////LocalInterconnect/////////////////////
 
 // assume all the packets are one flit
+// A packet is decomposed into one or more flits. A flit, the smallest unit   
+// on which flow control is performed, can advance once buffering in the next 
+// switch is available to hold the flit.
 #define LOCAL_INCT_FLIT_SIZE 40
 
+/*
+构造函数。
+*/
 LocalInterconnect* LocalInterconnect::New(
     const struct inct_config& m_localinct_config) {
   LocalInterconnect* icnt_interface = new LocalInterconnect(m_localinct_config);
@@ -291,6 +383,9 @@ LocalInterconnect* LocalInterconnect::New(
   return icnt_interface;
 }
 
+/*
+构造函数。
+*/
 LocalInterconnect::LocalInterconnect(
     const struct inct_config& m_localinct_config)
     : m_inct_config(m_localinct_config) {
@@ -305,12 +400,18 @@ LocalInterconnect::~LocalInterconnect() {
   }
 }
 
+/*
+创建互连网络。
+*/
 void LocalInterconnect::CreateInterconnect(unsigned m_n_shader,
                                            unsigned m_n_mem) {
+  //SM的个数。
   n_shader = m_n_shader;
+  //内存子分区的个数。
   n_mem = m_n_mem;
-
+  //子网络个数。在V100中配置为2，0号自网络负责REQ_NET，1号子网络负责REPLY_NET。
   net.resize(n_subnets);
+  //创建2个子网络，0号子网络负责REQ_NET，1号子网络负责REPLY_NET。
   for (unsigned i = 0; i < n_subnets; ++i) {
     net[i] = new xbar_router(i, static_cast<Interconnect_type>(i), m_n_shader,
                              m_n_mem, m_inct_config);
@@ -322,12 +423,18 @@ void LocalInterconnect::Init() {
   // there is nothing to do
 }
 
+/*
+数据包压入互连网络输入缓冲区。
+*/
 void LocalInterconnect::Push(unsigned input_deviceID, unsigned output_deviceID,
                              void* data, unsigned int size) {
   unsigned subnet;
+  //如果互连网络有多个子网络，则SM 0-n_shader 划分给subnet-0。
   if (n_subnets == 1) {
     subnet = 0;
   } else {
+    //input_deviceID < n_shader说明是SM侧发来的REQ，应设置子网络号为0，因为0号
+    //子网络负责REQ_NET。
     if (input_deviceID < n_shader) {
       subnet = 0;
     } else {
@@ -340,33 +447,51 @@ void LocalInterconnect::Push(unsigned input_deviceID, unsigned output_deviceID,
   // no flits are implemented
   assert(net[subnet]->Has_Buffer_In(input_deviceID, 1));
 
+  //数据包压入子网络。
   net[subnet]->Push(input_deviceID, output_deviceID, data, size);
 }
 
+/*
+数据包弹出互连网络输出缓冲区。
+*/
 void* LocalInterconnect::Pop(unsigned ouput_deviceID) {
   // 0-_n_shader-1 indicates reply(network 1), otherwise request(network 0)
   int subnet = 0;
+  //ouput_deviceID < n_shader说明是要向SM侧发出REPLY，应设置子网络号为1，因为1号
+  //子网络负责REPLY_NET。
   if (ouput_deviceID < n_shader) subnet = 1;
-
+  //将数据包从子网络弹出。
   return net[subnet]->Pop(ouput_deviceID);
 }
 
+/*
+互连网络执行路由一拍。
+*/
 void LocalInterconnect::Advance() {
   for (unsigned i = 0; i < n_subnets; ++i) {
     net[i]->Advance();
   }
 }
 
+/*
+判断互连网络是否处于Busy状态。有任意一个子网络处于Busy状态便认为整个互连网络处于
+Busy状态。
+*/
 bool LocalInterconnect::Busy() const {
   for (unsigned i = 0; i < n_subnets; ++i) {
+    //有任意一个子网络处于Busy状态便认为整个互连网络处于Busy状态。
     if (net[i]->Busy()) return true;
   }
   return false;
 }
 
+/*
+判断互连网络是否有空闲的输入缓冲可以容纳来自deviceID号设备新的数据包。
+*/
 bool LocalInterconnect::HasBuffer(unsigned deviceID, unsigned int size) const {
   bool has_buffer = false;
-
+  //设备号 >= SM数量时，属于内存子分区节点，用REPLY_NET子网络。反之属于SM节点，
+  //用REQ_NET子网络。
   if ((n_subnets > 1) && deviceID >= n_shader)  // deviceID is memory node
     has_buffer = net[REPLY_NET]->Has_Buffer_In(deviceID, 1, true);
   else

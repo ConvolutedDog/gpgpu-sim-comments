@@ -93,29 +93,50 @@ static unsigned intersim2_get_flit_size() {
 }
 
 //////////////////////////////////////////////////////
-
+/*
+创建互连网络。
+*/
 static void LocalInterconnect_create(unsigned int n_shader,
                                      unsigned int n_mem) {
   g_localicnt_interface->CreateInterconnect(n_shader, n_mem);
 }
 
+/*
+Nothing。
+*/
 static void LocalInterconnect_init() { g_localicnt_interface->Init(); }
 
+/*
+判断互连网络是否有空闲的输入缓冲可以容纳来自deviceID号设备新的数据包。
+*/
 static bool LocalInterconnect_has_buffer(unsigned input, unsigned int size) {
   return g_localicnt_interface->HasBuffer(input, size);
 }
 
+/*
+数据包压入互连网络输入缓冲区。
+*/
 static void LocalInterconnect_push(unsigned input, unsigned output, void* data,
                                    unsigned int size) {
   g_localicnt_interface->Push(input, output, data, size);
 }
 
+/*
+数据包弹出互连网络输出缓冲区。
+*/
 static void* LocalInterconnect_pop(unsigned output) {
   return g_localicnt_interface->Pop(output);
 }
 
+/*
+互连网络执行路由一拍。
+*/
 static void LocalInterconnect_transfer() { g_localicnt_interface->Advance(); }
 
+/*
+判断互连网络是否处于Busy状态。有任意一个子网络处于Busy状态便认为整个互连网络处于
+Busy状态。
+*/
 static bool LocalInterconnect_busy() { return g_localicnt_interface->Busy(); }
 
 static void LocalInterconnect_display_stats() {
@@ -135,7 +156,9 @@ static unsigned LocalInterconnect_get_flit_size() {
 }
 
 ///////////////////////////
-
+/*
+读取互连网络的配置信息。
+*/
 void icnt_reg_options(class OptionParser* opp) {
   option_parser_register(opp, "-network_mode", OPT_INT32, &g_network_mode,
                          "Interconnection network mode", "1");
@@ -160,6 +183,9 @@ void icnt_reg_options(class OptionParser* opp) {
                          &g_inct_config.grant_cycles, "grant_cycles", "1");
 }
 
+/*
+初始化互连网络的配置，指定互连网络的类型以及选择对应的Push/Pop等流程。
+*/
 void icnt_wrapper_init() {
   switch (g_network_mode) {
     case INTERSIM:
@@ -178,13 +204,23 @@ void icnt_wrapper_init() {
       icnt_get_flit_size = intersim2_get_flit_size;
       break;
     case LOCAL_XBAR:
+      //V100中配置的互连网络为XBAR，其定义在local_interconnect.h/.cc中。
+      //XBAR互连网络的构造函数。
       g_localicnt_interface = LocalInterconnect::New(g_inct_config);
+      //创建互连网络。
       icnt_create = LocalInterconnect_create;
+      //Nothing。
       icnt_init = LocalInterconnect_init;
+      //判断互连网络是否有空闲的输入缓冲可以容纳来自deviceID号设备新的数据包。
       icnt_has_buffer = LocalInterconnect_has_buffer;
+      //数据包压入互连网络输入缓冲区。
       icnt_push = LocalInterconnect_push;
+      //数据包弹出互连网络输出缓冲区。
       icnt_pop = LocalInterconnect_pop;
+      //互连网络执行路由一拍。
       icnt_transfer = LocalInterconnect_transfer;
+      //判断互连网络是否处于Busy状态。有任意一个子网络处于Busy状态便认为整个互连网络
+      //处于Busy状态。
       icnt_busy = LocalInterconnect_busy;
       icnt_display_stats = LocalInterconnect_display_stats;
       icnt_display_overall_stats = LocalInterconnect_display_overall_stats;

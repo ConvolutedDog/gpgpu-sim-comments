@@ -26,6 +26,10 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+/*
+stack.h/.cc “—Õ£÷π π”√°£
+*/
+
 #include "stack.h"
 
 #include <assert.h>

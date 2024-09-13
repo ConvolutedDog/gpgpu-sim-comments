@@ -62,29 +62,52 @@ const struct gpgpu_ptx_sim_info *ptx_sim_kernel_info(
 /*!
  * This class functionally executes a kernel. It uses the basic data structures
  * and procedures in core_t
+ * functionalCoreSim 类在功能上执行内核函数。它使用core_t中的基本数据结构和过程。
  */
 class functionalCoreSim : public core_t {
  public:
+  //构造函数。
   functionalCoreSim(kernel_info_t *kernel, gpgpu_sim *g, unsigned warp_size)
       : core_t(g, kernel, warp_size, kernel->threads_per_cta()) {
+    //warp屏障指示器，即每一个warp都有一个指示位，标志该warp是否进入屏障指令执行阶段。
+    //m_warpAtBarrier在构造函数中被定义为一个具有 warp总数 长度的bool变量。
+    //m_warp_count是一个CTA中的warp总数。
     m_warpAtBarrier = new bool[m_warp_count];
+    //每个warp活跃线程数。m_liveThreadCount在构造函数中被定义为一个具有[warp总数]长度的unsigned列表。
+    //m_warp_count是一个CTA中的warp总数。
     m_liveThreadCount = new unsigned[m_warp_count];
   }
+  //析构函数。
   virtual ~functionalCoreSim() {
+    //退出执行所有的warp。m_warp_count是一个CTA中的warp总数。参数0代表的 warp_id 在这里貌似没什么用。
     warp_exit(0);
     delete[] m_liveThreadCount;
     delete[] m_warpAtBarrier;
   }
   //! executes all warps till completion
+  //执行所有的 warp。
   void execute(int inst_count, unsigned ctaid_cp);
+  //退出执行所有的warp。m_warp_count是一个CTA中的warp总数。m_warp_size是一个warp内有多少线程。warp_id
+  //在这里貌似没什么用。
   virtual void warp_exit(unsigned warp_id);
+  //warp_waiting_at_barrier 函数用于检测是否一个warp正在屏障指令处等待下一步执行。即当 m_warpAtBarrier
+  //[warp_id] = 1 （warp_id所标识的warp正处于屏障指令阶段） 或者 !(m_liveThreadCount[warp_id] > 0)
+  //（warp_id所标识的warp此刻没有活跃的线程）时，则表明warp正在屏障指令处等待下一步执行。
   virtual bool warp_waiting_at_barrier(unsigned warp_id) const {
     return (m_warpAtBarrier[warp_id] || !(m_liveThreadCount[warp_id] > 0));
   }
 
  private:
+  //executeWarp函数的功能为执行一个warp。
+  //functionalCoreSim::executeWarp函数在functionalCoreSim::execute中的调用为：
+  //    executeWarp(i, allAtBarrier, someOneLive);
+  //三个参数分别为 warp_id、allAtBarrier、someOneLive。
+  //其中，i是一个CTA内的warp的编号，即warp_id，一个CTA内的warp从0开始编号。
+  //allAtBarrier初始设置为True，即初始状态默认“不是所有的warp都处于屏障指令状态”。
+  //someOneLive初始设置为False，即初始状态默认“所有的warp都暂时没有活跃的指令”。
   void executeWarp(unsigned, bool &, bool &);
   // initializes threads in the CTA block which we are executing
+  //执行CTA的初始化。初始化 ctaid_cp 标识的CTA中的所有线程。
   void initializeCTA(unsigned ctaid_cp);
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
                                              unsigned tid) {
@@ -94,10 +117,14 @@ class functionalCoreSim : public core_t {
   }
 
   // lunches the stack and set the threads count
+  //根据 warpId 创建该warp。
   void createWarp(unsigned warpId);
 
   // each warp live thread count and barrier indicator
+  //每个warp活跃线程数。m_liveThreadCount在构造函数中被定义为一个具有[warp总数]长度的unsigned列表。
   unsigned *m_liveThreadCount;
+  //warp屏障指示器，即每一个warp都有一个指示位，标志该warp是否进入屏障指令执行阶段。m_warpAtBarrier
+  //在构造函数中被定义为一个具有[warp总数]长度的bool列表。
   bool *m_warpAtBarrier;
 };
 

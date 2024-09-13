@@ -44,13 +44,38 @@
 
 #define MAX_DEFAULT_CACHE_SIZE_MULTIBLIER 4
 
+/*
+cache block的状态，包含：
+INVALID: Cache block有效，但是其中的byte mask=Cache block[mask]状态INVALID，说明sector
+         缺失。
+MODIFIED: 如果Cache block[mask]状态是MODIFIED，说明已经被其他线程修改，如果当前访问也是写
+          操作的话即为命中，但如果不是写操作则需要判断是否mask标志的块是否修改完毕，修改完毕
+          则为命中，修改不完成则为SECTOR_MISS。因为L1 cache与L2 cache写命中时，采用write-
+          back策略，只将数据写入该block，并不直接更新下级存储，只有当这个块被替换时，才将数
+          据写回下级存储。
+VALID: 如果Cache block[mask]状态是VALID，说明已经命中。
+RESERVED: 为尚未完成的缓存未命中的数据提供空间。Cache block[mask]状态是RESERVED，说明有其
+          他的线程正在读取这个Cache block。挂起的命中访问已命中处于RESERVED状态的缓存行，
+          这意味着同一行上已存在由先前缓存未命中发送的flying内存请求。
+*/
 enum cache_block_state { INVALID = 0, RESERVED, VALID, MODIFIED };
 
+/*
+对Cache请求的状态。包括：
+HIT，HIT_RESERVED，MISS，RESERVATION_FAIL，SECTOR_MISS，MSHR_HIT六种状态。
+*/
 enum cache_request_status {
+  //命中。
   HIT = 0,
+  //保留成功。
   HIT_RESERVED,
+  //未命中。
   MISS,
+  //保留失败。
   RESERVATION_FAIL,
+  //如果Cache block[mask]状态是MODIFIED，说明已经被其他线程修改，如果当前访问也是写
+  //操作的话即为命中，但如果不是写操作则需要判断是否mask标志的块是否修改完毕，修改完毕
+  //则为命中，修改不完成则为SECTOR_MISS。
   SECTOR_MISS,
   MSHR_HIT,
   NUM_CACHE_REQUEST_STATUS
@@ -65,10 +90,17 @@ enum cache_reservation_fail_reason {
   NUM_CACHE_RESERVATION_FAIL_STATUS
 };
 
+/*
+缓存事件类型。
+*/
 enum cache_event_type {
+  //写回请求。
   WRITE_BACK_REQUEST_SENT,
+  //读请求。
   READ_REQUEST_SENT,
+  //写请求。
   WRITE_REQUEST_SENT,
+  //写分配请求。
   WRITE_ALLOCATE_SENT
 };
 
@@ -78,7 +110,9 @@ enum cache_gpu_level {
   OTHER_GPU_CACHE,
   NUM_CACHE_GPU_LEVELS
 };
-
+/*
+写回时被逐出的block的信息。
+*/
 struct evicted_block_info {
   new_addr_type m_block_addr;
   unsigned m_modified_size;
@@ -94,18 +128,38 @@ struct evicted_block_info {
     m_block_addr = block_addr;
     m_modified_size = modified_size;
   }
+  //设置被逐出的cache block的信息。
   void set_info(new_addr_type block_addr, unsigned modified_size,
                 mem_access_byte_mask_t byte_mask,
                 mem_access_sector_mask_t sector_mask) {
+    //地址。
     m_block_addr = block_addr;
+    //被modified的sector数量。
     m_modified_size = modified_size;
+    //字节mask。
     m_byte_mask = byte_mask;
+    //sector mask。
     m_sector_mask = sector_mask;
   }
 };
 
+/*
+Cache事件，保存了缓存事件类型，和写回时被逐出的block的信息。
+*/
 struct cache_event {
+  //m_cache_event_type保存了缓存事件类型：
+  //   enum cache_event_type {
+  //     //写回请求。
+  //     WRITE_BACK_REQUEST_SENT,
+  //     //读请求。
+  //     READ_REQUEST_SENT,
+  //     //写请求。
+  //     WRITE_REQUEST_SENT,
+  //     //写分配请求。
+  //     WRITE_ALLOCATE_SENT
+  //   };
   enum cache_event_type m_cache_event_type;
+  //如果当前cache_event是写回事件，就需要更新m_evicted_block。
   evicted_block_info m_evicted_block;  // if it was write_back event, fill the
                                        // the evicted block info
 
@@ -122,12 +176,20 @@ struct cache_event {
 
 const char *cache_request_status_str(enum cache_request_status status);
 
+/*
+Cache block类。
+*/
 struct cache_block_t {
+  //构造函数。
   cache_block_t() {
+    //初始化设置cache block的tag位为0。
+    //  Memory  |————————|——————————|————————|
+    //  Address    Tag       Set    Byte Offset
     m_tag = 0;
+    //block的起始地址。
     m_block_addr = 0;
   }
-
+  //已经选定m_lines[idx]作为逐出并reserve新访问的cache line，这里执行对新访问的reserve操作。
   virtual void allocate(new_addr_type tag, new_addr_type block_addr,
                         unsigned time,
                         mem_access_sector_mask_t sector_mask) = 0;
@@ -148,9 +210,12 @@ struct cache_block_t {
   virtual mem_access_byte_mask_t get_dirty_byte_mask() = 0;
   virtual mem_access_sector_mask_t get_dirty_sector_mask() = 0;
   virtual unsigned long long get_last_access_time() = 0;
+  //设置当前cache line的最末次访问时间，包括sector的访问时间和line的访问时间。只有
+  //访问状态为Hit时才会设置。
   virtual void set_last_access_time(unsigned long long time,
                                     mem_access_sector_mask_t sector_mask) = 0;
   virtual unsigned long long get_alloc_time() = 0;
+  //在当前版本的GPGPU-Sim中，set_ignore_on_fill暂时用不到。
   virtual void set_ignore_on_fill(bool m_ignore,
                                   mem_access_sector_mask_t sector_mask) = 0;
   virtual void set_modified_on_fill(bool m_modified,
@@ -170,24 +235,37 @@ struct cache_block_t {
 };
 
 struct line_cache_block : public cache_block_t {
+  //构造函数。
   line_cache_block() {
     m_alloc_time = 0;
     m_fill_time = 0;
     m_last_access_time = 0;
+    //cache block的状态，包括 INVALID = 0, RESERVED, VALID, MODIFIED。
     m_status = INVALID;
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status = false;
     m_set_modified_on_fill = false;
     m_set_readable_on_fill = false;
     m_readable = true;
   }
+  //用于为特定的地址空间分配缓存块（cache block）。其参数如下：
+  // - tag：缓存块的标记（tag）
+  // - block_addr：缓存块的起始地址
+  // - time：当前时钟周期数
+  // - sector_mask：内存访问的扇区掩码
+  //该函数的作用是将指定的地址空间和对应缓存块相关联，并把该缓存块从缓存分区（cache set）中移除。同时
+  //会更新缓存统计信息和模拟器内部的时间计数器。
   void allocate(new_addr_type tag, new_addr_type block_addr, unsigned time,
                 mem_access_sector_mask_t sector_mask) {
     m_tag = tag;
     m_block_addr = block_addr;
     m_alloc_time = time;
+    //上次访问时间
     m_last_access_time = time;
     m_fill_time = 0;
+    //cache block的状态
     m_status = RESERVED;
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status = false;
     m_set_modified_on_fill = false;
     m_set_readable_on_fill = false;
@@ -205,6 +283,7 @@ struct line_cache_block : public cache_block_t {
 
     m_fill_time = time;
   }
+  //返回cache line的状态。对于Line Cache来说，cache line的状态与cache block的状态一致。
   virtual bool is_invalid_line() { return m_status == INVALID; }
   virtual bool is_valid_line() { return m_status == VALID; }
   virtual bool is_reserved_line() { return m_status == RESERVED; }
@@ -240,8 +319,10 @@ struct line_cache_block : public cache_block_t {
     m_last_access_time = time;
   }
   virtual unsigned long long get_alloc_time() { return m_alloc_time; }
+  //在当前版本的GPGPU-Sim中，set_ignore_on_fill暂时用不到。
   virtual void set_ignore_on_fill(bool m_ignore,
                                   mem_access_sector_mask_t sector_mask) {
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status = m_ignore;
   }
   virtual void set_modified_on_fill(bool m_modified,
@@ -274,6 +355,7 @@ struct line_cache_block : public cache_block_t {
   unsigned long long m_last_access_time;
   unsigned long long m_fill_time;
   cache_block_state m_status;
+  //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
   bool m_ignore_on_fill_status;
   bool m_set_modified_on_fill;
   bool m_set_readable_on_fill;
@@ -287,11 +369,16 @@ struct sector_cache_block : public cache_block_t {
 
   void init() {
     for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
+      //第i个sector被分配给新访问reserve的时间。
       m_sector_alloc_time[i] = 0;
       m_sector_fill_time[i] = 0;
+      //第i个sector被访问的时间，被访问包括第一次分配时的时间，也包括后续HIT该sector的时间。
       m_last_sector_access_time[i] = 0;
       m_status[i] = INVALID;
+      //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
       m_ignore_on_fill_status[i] = false;
+      //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache 
+      //block是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
       m_set_modified_on_fill[i] = false;
       m_set_readable_on_fill[i] = false;
       m_readable[i] = true;
@@ -301,12 +388,14 @@ struct sector_cache_block : public cache_block_t {
     m_line_fill_time = 0;
     m_dirty_byte_mask.reset();
   }
-
+  
+  //已经选定m_lines[idx]作为逐出并reserve新访问的cache line，这里执行对新访问的reserve操作。
   virtual void allocate(new_addr_type tag, new_addr_type block_addr,
                         unsigned time, mem_access_sector_mask_t sector_mask) {
     allocate_line(tag, block_addr, time, sector_mask);
   }
 
+  //已经选定m_lines[idx]作为逐出并reserve新访问的cache line，这里执行对新访问的reserve操作。
   void allocate_line(new_addr_type tag, new_addr_type block_addr, unsigned time,
                      mem_access_sector_mask_t sector_mask) {
     // allocate a new line
@@ -319,10 +408,15 @@ struct sector_cache_block : public cache_block_t {
 
     // set sector stats
     m_sector_alloc_time[sidx] = time;
+    //第sidx个sector被访问的时间，这里被访问是第一次分配时的时间。
     m_last_sector_access_time[sidx] = time;
     m_sector_fill_time[sidx] = 0;
+    //设置第sidx个sector为RESERVED。
     m_status[sidx] = RESERVED;
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status[sidx] = false;
+    //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache 
+    //block是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
     m_set_modified_on_fill[sidx] = false;
     m_set_readable_on_fill[sidx] = false;
     m_set_byte_mask_on_fill = false;
@@ -336,12 +430,19 @@ struct sector_cache_block : public cache_block_t {
   void allocate_sector(unsigned time, mem_access_sector_mask_t sector_mask) {
     // allocate invalid sector of this allocated valid line
     assert(is_valid_line());
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
 
     // set sector stats
+    //第sidx个sector被分配给新访问reserve的时间。
     m_sector_alloc_time[sidx] = time;
+    //第sidx个sector被访问的时间，被访问包括第一次分配时的时间，也包括后续HIT该sector的时间。
     m_last_sector_access_time[sidx] = time;
     m_sector_fill_time[sidx] = 0;
+    //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache block
+    //是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
     if (m_status[sidx] == MODIFIED)  // this should be the case only for
                                      // fetch-on-write policy //TO DO
       m_set_modified_on_fill[sidx] = true;
@@ -351,6 +452,7 @@ struct sector_cache_block : public cache_block_t {
     m_set_readable_on_fill[sidx] = false;
 
     m_status[sidx] = RESERVED;
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status[sidx] = false;
     // m_set_modified_on_fill[sidx] = false;
     m_readable[sidx] = true;
@@ -362,21 +464,39 @@ struct sector_cache_block : public cache_block_t {
 
   virtual void fill(unsigned time, mem_access_sector_mask_t sector_mask,
                     mem_access_byte_mask_t byte_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
 
     //	if(!m_ignore_on_fill_status[sidx])
     //	         assert( m_status[sidx] == RESERVED );
+    //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache 
+    //block是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
     m_status[sidx] = m_set_modified_on_fill[sidx] ? MODIFIED : VALID;
 
     if (m_set_readable_on_fill[sidx]) {
       m_readable[sidx] = true;
       m_set_readable_on_fill[sidx] = false;
     }
+    //在FETCH_ON_READ policy: https://arxiv.org/pdf/1810.07269.pdf 中提到，访问cache发生
+    //miss时：
+    // In the write-validate policy, no read fetch is required, instead each sector has 
+    // a bit-wise write-mask. When a write to a single byte is received, it writes the 
+    // byte to the sector, sets the corresponding write bit and sets the sector as valid 
+    // and modified. When a modified cache line is evicted, the cache line is written 
+    // back to the memory along with the write mask.
+    // 在write-validate策略中，不需要read fetch，而是每个扇区都有一个按位写掩码。当收到对单个
+    // 字节的写入时，它会将字节写入sector，设置相应的写入位，并将sector设置为有效且已修改。当修
+    // 改的缓存行被逐出时，缓存行将与写入掩码一起写回内存。
+    //而在FETCH_ON_READ中，需要设置sector的byte mask。这里就是指设置这个byte mask的标志。
     if (m_set_byte_mask_on_fill) set_byte_mask(byte_mask);
 
     m_sector_fill_time[sidx] = time;
     m_line_fill_time = time;
   }
+  // 当这个cache block中存在某个sector不是INVALID时，这个cache block就不是INVALID的。当所有的
+  // sector都是INVALID时，这个cache block才是INVALID的。
   virtual bool is_invalid_line() {
     // all the sectors should be invalid
     for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
@@ -384,7 +504,9 @@ struct sector_cache_block : public cache_block_t {
     }
     return true;
   }
+  // 当这个cache block中存在某个sector不是INVALID时，这个cache block就是VALID的。
   virtual bool is_valid_line() { return !(is_invalid_line()); }
+  // 当这个cache block中存在某个sector是RESERVED时，这个cache block就是RESERVED的。
   virtual bool is_reserved_line() {
     // if any of the sector is reserved, then the line is reserved
     for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
@@ -392,6 +514,7 @@ struct sector_cache_block : public cache_block_t {
     }
     return false;
   }
+  // 当这个cache block中存在某个sector是MODIFIED时，这个cache block就是MODIFIED的。
   virtual bool is_modified_line() {
     // if any of the sector is modified, then the line is modified
     for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
@@ -399,20 +522,27 @@ struct sector_cache_block : public cache_block_t {
     }
     return false;
   }
-
+  // 返回cache block的某个sector的状态，这个sector由输入参数sector_mask确定。
   virtual enum cache_block_state get_status(
       mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
 
     return m_status[sidx];
   }
-
+  // 设置cache block的某个sector的状态为传入参数status，这个sector由输入参数sector_mask
+  // 确定。
   virtual void set_status(enum cache_block_state status,
                           mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
     m_status[sidx] = status;
   }
-
+  // 设置cache block的byte mask。
   virtual void set_byte_mask(mem_fetch *mf) {
     m_dirty_byte_mask = m_dirty_byte_mask | mf->get_access_byte_mask();
   }
@@ -433,24 +563,38 @@ struct sector_cache_block : public cache_block_t {
     return m_line_last_access_time;
   }
 
+  //设置当前cache line的最末次访问时间，包括sector的访问时间和line的访问时间。只有
+  //访问状态为Hit时才会设置。
   virtual void set_last_access_time(unsigned long long time,
                                     mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
-
+    //第sidx个sector被访问的时间，这里被访问是HIT该sector的时间。
     m_last_sector_access_time[sidx] = time;
     m_line_last_access_time = time;
   }
 
   virtual unsigned long long get_alloc_time() { return m_line_alloc_time; }
-
+  //在当前版本的GPGPU-Sim中，set_ignore_on_fill暂时用不到。
   virtual void set_ignore_on_fill(bool m_ignore,
                                   mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
+    //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
     m_ignore_on_fill_status[sidx] = m_ignore;
   }
 
+  //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache 
+  //block是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
   virtual void set_modified_on_fill(bool m_modified,
                                     mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
     m_set_modified_on_fill[sidx] = m_modified;
   }
@@ -460,16 +604,25 @@ struct sector_cache_block : public cache_block_t {
 
   virtual void set_readable_on_fill(bool readable,
                                     mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
     m_set_readable_on_fill[sidx] = readable;
   }
   virtual void set_m_readable(bool readable,
                               mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
     m_readable[sidx] = readable;
   }
 
   virtual bool is_readable(mem_access_sector_mask_t sector_mask) {
+    //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+    //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+    //例如0001返回0，0010返回1，0100返回2，1000返回3。
     unsigned sidx = get_sector_index(sector_mask);
     return m_readable[sidx];
   }
@@ -488,20 +641,30 @@ struct sector_cache_block : public cache_block_t {
   }
 
  private:
+  //4个sector被分配给新访问reserve的时间。
   unsigned m_sector_alloc_time[SECTOR_CHUNCK_SIZE];
+  //4个sector被访问的时间，被访问包括第一次分配时的时间，也包括后续HIT该sector的时间。
   unsigned m_last_sector_access_time[SECTOR_CHUNCK_SIZE];
   unsigned m_sector_fill_time[SECTOR_CHUNCK_SIZE];
   unsigned m_line_alloc_time;
   unsigned m_line_last_access_time;
   unsigned m_line_fill_time;
+  //每个sector的状态，包括INVALID = 0, RESERVED, VALID, MODIFIED。
   cache_block_state m_status[SECTOR_CHUNCK_SIZE];
+  //在当前版本的GPGPU-Sim中，m_ignore_on_fill_status暂时用不到。
   bool m_ignore_on_fill_status[SECTOR_CHUNCK_SIZE];
+  //cache block的每个sector都有一个标志位m_set_modified_on_fill[i]，标记着这个cache 
+  //4个sector是否被修改，在sector_cache_block::fill()函数调用的时候会使用。
   bool m_set_modified_on_fill[SECTOR_CHUNCK_SIZE];
   bool m_set_readable_on_fill[SECTOR_CHUNCK_SIZE];
   bool m_set_byte_mask_on_fill;
   bool m_readable[SECTOR_CHUNCK_SIZE];
   mem_access_byte_mask_t m_dirty_byte_mask;
 
+  //sector_mask是要访问的sector的mask，例如V100中每个cache block有4个sector，那么这个
+  //sector_mask就有可能是0001/0010/0100/1000，这里是判断mask为1的sector属于第几个sector
+  //例如0001返回0，0010返回1，0100返回2，1000返回3。实际上就是返回sector_mask中的第一个
+  //为1的位置，即sector在当前cache line的index。
   unsigned get_sector_index(mem_access_sector_mask_t sector_mask) {
     assert(sector_mask.count() == 1);
     for (unsigned i = 0; i < SECTOR_CHUNCK_SIZE; ++i) {
@@ -553,17 +716,48 @@ enum cache_type { NORMAL = 0, SECTOR };
 #define MAX_WARP_PER_SHADER 64
 #define MAX_WARP_PER_SHADER 64
 
+/*
+Cache配置类。
+*/
 class cache_config {
  public:
   cache_config() {
     m_valid = false;
+    // 是否当前cache被禁用。
     m_disabled = false;
+    // m_config_string will be set by option parser, using .config file
     m_config_string = NULL;  // set by option parser
+    // 当前这个配置已经停用。
     m_config_stringPrefL1 = NULL;
+    // 当前这个配置已经停用。
     m_config_stringPrefShared = NULL;
+    // 对cache的access和fill分别需要占用数据端口和填充端口，这里是bandwidth_management
+    // 做管理使用。详细的使用看：
+    //     bool baseline_cache::bandwidth_management::use_data_port();
+    //     bool baseline_cache::bandwidth_management::use_fill_port();
     m_data_port_width = 0;
+    // cache_config::hash_function()返回地址在Cache中的set。这个m_set_index_function
+    // 是用作计算set的方式，即确定了地址到set的映射方式。
     m_set_index_function = LINEAR_SET_FUNCTION;
+    // 流式缓存标志：
+    // if (m_L1D_config.is_streaming()) {
+    //   // for streaming cache, if the whole memory is allocated
+    //   // to the L1 cache, then make the allocation to be on_MISS
+    //   // otherwise, make it ON_FILL to eliminate line allocation fails
+    //   // i.e. MSHR throughput is the same, independent on the L1 cache
+    //   // size/associativity
+    //   if (total_shmem == 0) {
+    //     m_L1D_config.set_allocation_policy(ON_MISS);
+    //     printf("GPGPU-Sim: Reconfigure L1 allocation to ON_MISS\n");
+    //   } else {
+    //     m_L1D_config.set_allocation_policy(ON_FILL);
+    //     printf("GPGPU-Sim: Reconfigure L1 allocation to ON_FILL\n");
+    //   }
+    // }
     m_is_streaming = false;
+    // 在逐出一个cache块时，优先逐出一个干净的块，即没有sector被RESERVED，也没有sector被
+    // MODIFIED，来逐出；但是如果dirty的cache line的比例超过m_wr_percent（V100中配置为
+    // 25%），也可以不满足MODIFIED的条件。
     m_wr_percent = 0;
   }
   void init(char *config, FuncCache status) {
@@ -571,6 +765,89 @@ class cache_config {
     assert(config);
     char ct, rp, wp, ap, mshr_type, wap, sif;
 
+    // Cache配置参数：
+    //   <sector?>:<nsets>:<bsize>:<assoc>,
+    //   <rep>:<wr>:<alloc>:<wr_alloc>:<set_index_fn>,
+    //   <mshr>:<N>:<merge>,<mq>:**<fifo_entry>
+    // GV100配置示例：
+    //   -gpgpu_cache:dl1  S:4:128:64,  L:T:m:L:L, A:512:8, 16:0,32
+    //   -gpgpu_cache:dl2  S:32:128:24, L:B:m:L:P, A:192:4, 32:0,32
+    //   -gpgpu_cache:il1  N:64:128:16, L:R:f:N:L, S:2:48,  4
+    // 在GV100的MSHR type上，L1D为ASSOC，L2D为ASSOC，L1I为SECTOR_ASSOC。
+    //   TEX_FIFO,         // Tex cache
+    //   ASSOC,            // normal cache
+    //   SECTOR_TEX_FIFO,  // Tex cache sends requests to high-level sector cache
+    //   SECTOR_ASSOC      // normal cache sends requests to high-level sector cache
+    // ct：m_cache_type，包括：
+    //     1. NORMAL：cache的每个block被组织成一整个line。
+    //     2. SECTOR：cache的每个block被组织成SECTOR_CHUNCK_SIZE个sector。
+    // rp：m_replacement_policy，替换策略，分为LRU和FIFO。
+    // wp：m_write_policy，写策略，包括：
+    //     1. READ_ONLY：已被弃用，TEX Cache和READONLY Cache已经单独成class，这个配置
+    //                    已经失效了。
+    //     2. WRITE_BACK：写回策略，即当写命中时，只需要将数据单写更新cache，不需要直接将
+    //                    数据写入下一级存储。详见data_cache::wr_hit_wb函数。
+    //     3. WRITE_THROUGH：写直达策略，与写回策略不同的是，在完成写更新cache，需要直接
+    //                    将数据写入下一级存储，通过send_write_request()函数下发写回
+    //                    请求，详见data_cache::wr_hit_wt。
+    //     4. WRITE_EVICT：写逐出策略，当写命中时，直接逐出当前块（代码中设置该块为无效），
+    //                    并通过send_write_request()函数下发写回到下级存储的请求，详见
+    //                    data_cache::wr_hit_we。这种策略会导致经常性的cache逐出，因此
+    //                    不常使用。
+    //     5. LOCAL_WB_GLOBAL_WT：Global write-evict, local write-back: Useful for 
+    //                    private caches。即对于GLOBAL_ACC_W请求，采取写逐出策略，其他
+    //                    请求采取写回策略。一般来说L2D Cache均采用写回策略，对L1D Cache
+    //                    则采用LOCAL_WB_GLOBAL_WT策略。
+    // ap：m_alloc_policy，分配策略。对于发送到 L1 D 缓存的请求，如果命中，则立即返回所需
+    //                    数据；如果未命中，则分配与缓存未命中相关的资源并将请求转发到 L2 
+    //                    缓存。Allocate-on-miss 和 allocateon-fill 是两种缓存行分配策
+    //                    略。对于 allocateon-miss，需要为未完成的未命中分配一个缓存行槽、
+    //                    一个 MSHR 和一个未命中队列条目。相比之下，allocate-on-fill，当
+    //                    未完成的未命中发生时，需要分配一个 MSHR 和一个未命中队列条目，但
+    //                    当所需数据从较低内存级别返回时，会选择受害者缓存行槽。在这两种策
+    //                    略中，如果任何所需资源不可用，则会发生预留失败，内存管道会停滞。
+    //                    分配的 MSHR 会被保留，直到从 L2 缓存/片外内存中获取数据，而未命
+    //                    中队列条目会在未命中请求转发到 L2 缓存后被释放。由于 allocate-
+    //                    on-fill 在驱逐之前将受害者缓存行保留在缓存中更长时间，并为未完
+    //                    成的未命中保留更少的资源，因此它往往能获得更多的缓存命中和更少的
+    //                    预留失败，从而比 allocate-on-miss 具有更好的性能。尽管填充时分
+    //                    配需要额外的缓冲和流控制逻辑来按顺序将数据填充到缓存中，但按顺序
+    //                    执行模型和写入驱逐策略使 GPU L1 D 缓存对填充时分配很友好，因为
+    //                    在填充时要驱逐受害者缓存时，没有脏数据写入 L2。
+    //                    详见 paper：The Demand for a Sound Baseline in GPU Memory 
+    //                    Architecture Research. 
+    //                    https://hzhou.wordpress.ncsu.edu/files/2022/12/Hongwen_WDDD2017.pdf
+    //
+    //                    For streaming cache: (1) we set the alloc policy to be on-
+    //                    fill to remove all line_alloc_fail stalls. if the whole me-
+    //                    mory is allocated to the L1 cache, then make the allocation 
+    //                    to be on_MISS otherwise, make it ON_FILL to eliminate line 
+    //                    allocation fails. i.e. MSHR throughput is the same, indepen-
+    //                    dent on the L1 cache size/associativity So, we set the allo-
+    //                    cation policy per kernel basis, see shader.cc, max_cta() 
+    //                    function. (2) We also set the MSHRs to be equal to max allo-
+    //                    cated cache lines. This is possible by moving TAG to be sha-
+    //                    red between cache line and MSHR enrty (i.e. for each cache 
+    //                    line, there is an MSHR rntey associated with it). This is 
+    //                    the easiest think we can think of to model (mimic) L1 stream-
+    //                    ing cache in Pascal and Volta. For more information about 
+    //                    streaming cache, see: 
+    //                    http://on-demand.gputechconf.com/gtc/2017/presentation/s7798-luke-durant-inside-volta.pdf
+    //                    https://ieeexplore.ieee.org/document/8344474/
+    // wap：m_write_alloc_policy，写分配策略，包括：
+    //                    NO_WRITE_ALLOCATE：写不分配策略主要是指当发生写缺失时，不将数据
+    //                    块加载到缓存，而是直接写到内存中。这种策略适用于数据重用率较低的
+    //                    场景，因为将数据加载到缓存中没有实际意义，反而会浪费缓存空间。详见
+    //                    代码 enum cache_request_status data_cache::wr_miss_no_wa。
+    //                    WRITE_ALLOCATE：这是最早GPGPU-Sim版本的写分配策略，可能要从cache
+    //                    里逐出一个块或者一个sector，然后将块加载到缓存再写入。
+    //                    FETCH_ON_WRITE：TODO
+    //                    ??? TODO
+    // sif：m_set_index_function，由访存地址计算映射到的cache块在那个set的哈希方法。包括：
+    //                    FERMI_HASH_SET_FUNCTION，HASH_IPOLY_FUNCTION，
+    //                    CUSTOM_SET_FUNCTION，LINEAR_SET_FUNCTION，
+    //                    BITWISE_XORING_FUNCTION。
+    // 
     int ntok =
         sscanf(config, "%c:%u:%u:%u,%c:%c:%c:%c:%c,%c:%u:%u,%u:%u,%u", &ct,
                &m_nset, &m_line_sz, &m_assoc, &rp, &wp, &ap, &wap, &sif,
@@ -605,6 +882,7 @@ class cache_config {
       default:
         exit_parse_error();
     }
+    //在V100配置中，L1 cache为'T'，L2 cache为'B'。
     switch (wp) {
       case 'R':
         m_write_policy = READ_ONLY;
@@ -659,6 +937,9 @@ class cache_config {
       */
       m_is_streaming = true;
       m_alloc_policy = ON_FILL;
+      //m_mshr_entries = m_nset * m_assoc * MAX_DEFAULT_CACHE_SIZE_MULTIBLIER;
+      //if (m_cache_type == SECTOR) m_mshr_entries *= SECTOR_CHUNCK_SIZE;
+      //m_mshr_max_merge = MAX_WARP_PER_SM;
     }
     switch (mshr_type) {
       case 'F':
@@ -681,6 +962,7 @@ class cache_config {
     m_line_sz_log2 = LOGB2(m_line_sz);
     m_nset_log2 = LOGB2(m_nset);
     m_valid = true;
+    //cache替换原子操作的粒度，如果cache是SECTOR类型的，粒度为SECTOR_SIZE，否则为line_size。
     m_atom_sz = (m_cache_type == SECTOR) ? SECTOR_SIZE : m_line_sz;
     m_sector_sz_log2 = LOGB2(SECTOR_SIZE);
     original_m_assoc = m_assoc;
@@ -700,6 +982,7 @@ class cache_config {
         m_write_alloc_policy = FETCH_ON_WRITE;
         break;
       case 'L':
+        // 论文：https://arxiv.org/pdf/1810.07269.pdf
         m_write_alloc_policy = LAZY_FETCH_ON_READ;
         break;
       default:
@@ -749,6 +1032,7 @@ class cache_config {
     assert(m_line_sz % m_data_port_width == 0);
 
     switch (sif) {
+      //L1D是"L"-LINEAR_SET_FUNCTION，L2D是"P"-HASH_IPOLY_FUNCTION。
       case 'H':
         m_set_index_function = FERMI_HASH_SET_FUNCTION;
         break;
@@ -789,6 +1073,7 @@ class cache_config {
     assert(m_valid);
     return get_max_cache_multiplier() * original_m_assoc;
   }
+  //Cache分成多个组(set)，每个组分成多个行(way)，每个行存储字节数是line_size。
   void print(FILE *fp) const {
     fprintf(fp, "Size = %d B (%d Set x %d-way x %d byte line)\n",
             m_line_sz * m_nset * m_assoc, m_nset, m_assoc, m_line_sz);
@@ -804,6 +1089,9 @@ class cache_config {
                          unsigned m_line_sz_log2, unsigned m_nset_log2,
                          unsigned m_index_function) const;
 
+  //为了便于起见，这里的标记包括index和Tag。这允许更复杂的（可能导致不同的indexes映射到
+  //同一set）set index计算，因此需要完整的标签 + 索引来检查命中/未命中。Tag现在与块地址
+  //相同。
   new_addr_type tag(new_addr_type addr) const {
     // For generality, the tag includes both index and tag. This allows for more
     // complex set index calculations that can result in different indexes
@@ -811,11 +1099,28 @@ class cache_config {
     // for hit/miss. Tag is now identical to the block address.
 
     // return addr >> (m_line_sz_log2+m_nset_log2);
+    //这里实际返回的是除offset位以外的所有位+m_atom_sz'b0，即set index也作为tag的一部分了。
     return addr & ~(new_addr_type)(m_line_sz - 1);
   }
+  //返回cache block的地址，该地址即为地址addr的tag位+set index位。即除offset位以外的所
+  //有位。
+  //|-------|-------------|--------------|
+  //   tag     set_index   offset in-line  
+  //m_line_sz = SECTOR_SIZE * SECTOR_CHUNCK_SIZE = 32 bytes/sector * 4 sectors = 128 bytes。
   new_addr_type block_addr(new_addr_type addr) const {
     return addr & ~(new_addr_type)(m_line_sz - 1);
   }
+  //返回mshr的地址，该地址即为地址addr的tag位+set index位+sector offset位。即除single sector 
+  //byte offset位以外的所有位+m_atom_sz'b0。
+  //|<----------mshr_addr----------->|
+  //                   sector off    byte off in-sector
+  //                   |-------------|-----------|
+  //                    \                       /
+  //                     \                     /
+  //|-------|-------------|-------------------|
+  //   tag     set_index     offset in-line
+  //对于sector cache，m_atom_sz = SECTOR_SIZE = 32 bytes/sector。
+  //对于line cache，m_atom_sz = LINE_SIZE。
   new_addr_type mshr_addr(new_addr_type addr) const {
     return addr & ~(new_addr_type)(m_atom_sz - 1);
   }
@@ -824,10 +1129,12 @@ class cache_config {
     // set new assoc. L1 cache dynamically resized in Volta
     m_assoc = n;
   }
+  //返回cache有多少个set。
   unsigned get_nset() const {
     assert(m_valid);
     return m_nset;
   }
+  //以KB为单位，返回整个cache的大小。
   unsigned get_total_size_inKB() const {
     assert(m_valid);
     return (m_assoc * m_nset * m_line_sz) / 1024;
@@ -856,16 +1163,26 @@ class cache_config {
 
   bool m_valid;
   bool m_disabled;
+  //cache line的大小，以字节为单位。
   unsigned m_line_sz;
+  //m_line_sz_log2 = log2(m_line_sz)。
   unsigned m_line_sz_log2;
+  //cache有多少个set。
   unsigned m_nset;
+  //m_nset_log2 = log2(m_nset)。
   unsigned m_nset_log2;
+  //cache有多少way。
   unsigned m_assoc;
+  //m_atom_sz = (m_cache_type == SECTOR) ? SECTOR_SIZE : m_line_sz;
   unsigned m_atom_sz;
+  //m_sector_sz_log2 = LOGB2(SECTOR_SIZE);
   unsigned m_sector_sz_log2;
+  //original assoc (defined in config '-gpgpu_cache:dl1').
   unsigned original_m_assoc;
+  //当前cache是否是Streaming Cache。
   bool m_is_streaming;
 
+  //替换策略，分为LRU和FIFO。
   enum replacement_policy_t m_replacement_policy;  // 'L' = LRU, 'F' = FIFO
   enum write_policy_t
       m_write_policy;  // 'T' = write through, 'B' = write back, 'R' = read only
@@ -878,10 +1195,12 @@ class cache_config {
       m_write_alloc_policy;  // 'W' = Write allocate, 'N' = No write allocate
 
   union {
+    // MSHR Table内的entries的个数。
     unsigned m_mshr_entries;
     unsigned m_fragment_fifo_entries;
   };
   union {
+    // MSHR Table内的每个entries的最大可合并地址的个数。
     unsigned m_mshr_max_merge;
     unsigned m_request_fifo_entries;
   };
@@ -919,15 +1238,30 @@ class l1d_cache_config : public cache_config {
   unsigned l1_banks_byte_interleaving;
   unsigned l1_banks_byte_interleaving_log2;
   unsigned l1_banks_hashing_function;
+  // In Volta, the authors assign the remaining shared memory to L1 cache,
+  // if the assigned shd mem = 0, then L1 cache = 128KB.
+  // Defualt config -gpgpu_cache:dl1 is 32KB DL1 and 96KB shared memory.
+  // m_unified_cache_size = config '-gpgpu_unified_l1d_size' = shared mem 
+  // size + L1 cache size.
+  // And the max L1 cache size can be extended to 4 times of the default 
+  // config '-gpgpu_cache:dl1', so here the authors defined thid parameter
+  // MAX_DEFAULT_CACHE_SIZE_MULTIBLIER = 4, which will be used in function
+  // get_max_cache_multiplier().
   unsigned m_unified_cache_size;
   virtual unsigned get_max_cache_multiplier() const {
     // set * assoc * cacheline size. Then convert Byte to KB
     // gpgpu_unified_cache_size is in KB while original_sz is in B
     if (m_unified_cache_size > 0) {
+      // Here the authors just calculate the ratio of m_unified_cache_size
+      // (config '-gpgpu_unified_l1d_size') and original_m_assoc (defined 
+      // in config '-gpgpu_cache:dl1').
       unsigned original_size = m_nset * original_m_assoc * m_line_sz / 1024;
       assert(m_unified_cache_size % original_size == 0);
       return m_unified_cache_size / original_size;
     } else {
+      // if m_unified_cache_size is not defined, so just defaultly set the 
+      // m_unified_cache_size / original_size to be 4. It means that the 
+      // current programe only uses 32KB of L1D, and 96KB of shared memory. 
       return MAX_DEFAULT_CACHE_SIZE_MULTIBLIER;
     }
   }
@@ -943,21 +1277,63 @@ class l2_cache_config : public cache_config {
   linear_to_raw_address_translation *m_address_mapping;
 };
 
+/*
+常量缓存和数据缓存都包含一个成员tag_array对象，实现了保留和替换逻辑。probe()函数检查一个块地址而不影响相
+关数据的LRU位置，而access()是为了模拟一个影响LRU位置的查找，是产生未命中和访问统计的函数。纹理缓存没有使
+用tag_array，因为它的操作与传统的缓存有很大的不同。
+*/
 class tag_array {
  public:
   // Use this constructor
   tag_array(cache_config &config, int core_id, int type_id);
   ~tag_array();
-
+  //判断对cache的访问（地址为addr，sector mask为mask）是HIT/HIT_RESERVED/SECTOR_MISS/
+  //MISS/RESERVATION_FAIL等状态。
+  //对一个cache进行数据访问的时候，调用data_cache::access()函数：
+  //- 首先cahe会调用m_tag_array->probe()函数，判断对cache的访问（地址为addr，sector mask
+  //  为mask）是HIT/HIT_RESERVED/SECTOR_MISS/MISS/RESERVATION_FAIL等状态。
+  //- 然后调用process_tag_probe()函数，根据cache的配置以及上面m_tag_array->probe()函数返
+  //  回的cache访问状态，执行相应的操作。
+  //  - process_tag_probe()函数中，会根据请求的读写状态，probe()函数返回的cache访问状态，
+  //    执行m_wr_hit/m_wr_miss/m_rd_hit/m_rd_miss函数，他们会调用m_tag_array->access()
+  //    函数来实现LRU状态的更新。
   enum cache_request_status probe(new_addr_type addr, unsigned &idx,
                                   mem_fetch *mf, bool is_write,
                                   bool probe_mode = false) const;
+  //判断对cache的访问（地址为addr，sector mask为mask）是HIT/HIT_RESERVED/SECTOR_MISS/
+  //MISS/RESERVATION_FAIL等状态。
+  //对一个cache进行数据访问的时候，调用data_cache::access()函数：
+  //- 首先cahe会调用m_tag_array->probe()函数，判断对cache的访问（地址为addr，sector mask
+  //  为mask）是HIT/HIT_RESERVED/SECTOR_MISS/MISS/RESERVATION_FAIL等状态。
+  //- 然后调用process_tag_probe()函数，根据cache的配置以及上面m_tag_array->probe()函数返
+  //  回的cache访问状态，执行相应的操作。
+  //  - process_tag_probe()函数中，会根据请求的读写状态，probe()函数返回的cache访问状态，
+  //    执行m_wr_hit/m_wr_miss/m_rd_hit/m_rd_miss函数，他们会调用m_tag_array->access()
+  //    函数来实现LRU状态的更新。
   enum cache_request_status probe(new_addr_type addr, unsigned &idx,
                                   mem_access_sector_mask_t mask, bool is_write,
                                   bool probe_mode = false,
                                   mem_fetch *mf = NULL) const;
+  //更新LRU状态。Least Recently Used。返回是否需要写回wb以及逐出的cache line的信息evicted。
+  //对一个cache进行数据访问的时候，调用data_cache::access()函数：
+  //- 首先cahe会调用m_tag_array->probe()函数，判断对cache的访问（地址为addr，sector mask
+  //  为mask）是HIT/HIT_RESERVED/SECTOR_MISS/MISS/RESERVATION_FAIL等状态。
+  //- 然后调用process_tag_probe()函数，根据cache的配置以及上面m_tag_array->probe()函数返
+  //  回的cache访问状态，执行相应的操作。
+  //  - process_tag_probe()函数中，会根据请求的读写状态，probe()函数返回的cache访问状态，
+  //    执行m_wr_hit/m_wr_miss/m_rd_hit/m_rd_miss函数，他们会调用m_tag_array->access()
+  //    函数来实现LRU状态的更新。
   enum cache_request_status access(new_addr_type addr, unsigned time,
                                    unsigned &idx, mem_fetch *mf);
+  //更新LRU状态。Least Recently Used。返回是否需要写回wb以及逐出的cache line的信息evicted。
+  //对一个cache进行数据访问的时候，调用data_cache::access()函数：
+  //- 首先cahe会调用m_tag_array->probe()函数，判断对cache的访问（地址为addr，sector mask
+  //  为mask）是HIT/HIT_RESERVED/SECTOR_MISS/MISS/RESERVATION_FAIL等状态。
+  //- 然后调用process_tag_probe()函数，根据cache的配置以及上面m_tag_array->probe()函数返
+  //  回的cache访问状态，执行相应的操作。
+  //  - process_tag_probe()函数中，会根据请求的读写状态，probe()函数返回的cache访问状态，
+  //    执行m_wr_hit/m_wr_miss/m_rd_hit/m_rd_miss函数，他们会调用m_tag_array->access()
+  //    函数来实现LRU状态的更新。
   enum cache_request_status access(new_addr_type addr, unsigned time,
                                    unsigned &idx, bool &wb,
                                    evicted_block_info &evicted, mem_fetch *mf);
@@ -983,6 +1359,7 @@ class tag_array {
   void update_cache_parameters(cache_config &config);
   void add_pending_line(mem_fetch *mf);
   void remove_pending_line(mem_fetch *mf);
+  //当一个cache block被MODIFIED时，将其标记为DIRTY，则dirty的数量就应该加1。
   void inc_dirty() { m_dirty++; }
 
  protected:
@@ -996,14 +1373,27 @@ class tag_array {
  protected:
   cache_config &m_config;
 
+  //cache block的所有集合。
+  // For example, 4 sets, 6 ways:
+  // |  0  |  1  |  2  |  3  |  4  |  5  |  // set_index 0
+  // |  6  |  7  |  8  |  9  |  10 |  11 |  // set_index 1
+  // |  12 |  13 |  14 |  15 |  16 |  17 |  // set_index 2
+  // |  18 |  19 |  20 |  21 |  22 |  23 |  // set_index 3
+  //                |--------> index => cache_block_t *line
+  //m_lines[index] = &m_lines[set_index * m_config.m_assoc + way_index]
   cache_block_t **m_lines; /* nbanks x nset x assoc lines in total */
 
+  //对当前tag_array的访问次数。
   unsigned m_access;
+  //对当前cache访问的miss次数。
   unsigned m_miss;
   unsigned m_pending_hit;  // number of cache miss that hit a line that is
                            // allocated but not filled
+  //Reservation Failed的次数。
   unsigned m_res_fail;
+  //Sector Miss的次数。
   unsigned m_sector_miss;
+  //Dirty block的个数。
   unsigned m_dirty;
 
   // performance counters for calculating the amount of misses within a time
@@ -1012,19 +1402,44 @@ class tag_array {
   unsigned m_prev_snapshot_miss;
   unsigned m_prev_snapshot_pending_hit;
 
+  //当前cache所属的Shader Core的ID。
   int m_core_id;  // which shader core is using this
+  //什么类型的cahce，包括Normal，Texture，Constant。
   int m_type_id;  // what kind of cache is this (normal, texture, constant)
 
+  //标记当前tag_array所属cache是否被使用过。一旦有access()函数被调用，则说明被使用过。
   bool is_used;  // a flag if the whole cache has ever been accessed before
 
+  //已经弃用了。
   typedef tr1_hash_map<new_addr_type, unsigned> line_table;
+  //已经弃用了。
   line_table pending_lines;
 };
 
+/*
+未命中状态保持寄存器，the miss status holding register，MSHR。MSHR的模型是用mshr_table类来模拟
+一个具有有限数量的合并请求的完全关联表。请求通过next_access()函数从MSHR中释放。MSHR表具有固定数量
+的MSHR条目。每个MSHR条目可以为单个缓存行（cache line）提供固定数量的未命中请求。MSHR条目的数量和每
+个条目的最大请求数是可配置的。
+
+缓存未命中状态保持寄存器。缓存命中后，将立即向寄存器文件发送数据，以满足请求。在缓存未命中时，未命中
+处理逻辑将首先检查未命中状态保持寄存器（MSHR），以查看当前是否有来自先前请求的相同请求挂起。如果是，
+则此请求将合并到同一条目中，并且不需要发出新的数据请求。否则，将为该数据请求保留一个新的MSHR条目和缓
+存行。缓存状态处理程序可能会在资源不可用时失败，例如没有可用的MSHR条目、该集中的所有缓存块都已保留但
+尚未填充、未命中队列已满等。
+*/
 class mshr_table {
  public:
+  //构造函数。参数为：
+  //    num_entries：MSHR中的条目的个数。
+  //    max_merged：MSHR中的单个条目的最大请求数，当一个请求正在运行时，对内存系统的冗余访问被合
+  //                并到MSHR中。此请求将合并到同一条目中，并且不需要发出新的数据请求。
+  //    m_data：std::unordered_map，是<new_addr_type, mshr_entry>的无序map。
   mshr_table(unsigned num_entries, unsigned max_merged)
       : m_num_entries(num_entries),
+        // 这部分实际上是用来初始化 m_data 的桶数（bucket count）的。尽管 std::unordered_map 一
+        // 般情况下不需要明确指定桶数，但通过这种方式控制哈希表的初始容量以减少重新哈希的频率，从而
+        // 提升性能。
         m_max_merged(max_merged)
 #if (tr1_hash_map_ismap == 0)
         ,
@@ -1034,21 +1449,39 @@ class mshr_table {
   }
 
   /// Checks if there is a pending request to the lower memory level already
+  //检查是否已存在对较低内存级别的挂起请求。即检查m_data中是否存在地址为block_addr的条目。
   bool probe(new_addr_type block_addr) const;
   /// Checks if there is space for tracking a new memory access
+  //检查是否有空间处理新的内存访问。首先查找是否MSHR表中有 block_addr 地址的条目。如果存在该条目，
+  //看是否有空间合并进该条目。如果不存在该条目，看是否有其他空闲条目添加。
   bool full(new_addr_type block_addr) const;
   /// Add or merge this access
+  //添加或合并此访问。通常与m_mshrs.probe和!m_mshrs.full联合使用。如果m_data中存在地址为block_
+  //addr，且该条目的m_list.size() < m_max_merged，则将mf添加到该条目的m_list中。否则，将mf作为
+  //一个新的条目添加到m_data中。
   void add(new_addr_type block_addr, mem_fetch *mf);
   /// Returns true if cannot accept new fill responses
+  //如果无法接受新的填充响应，则返回true。
   bool busy() const { return false; }
   /// Accept a new cache fill response: mark entry ready for processing
+  //接受新的缓存填充响应：标记条目以备处理。这个函数会在cache填充响应时调用，用来标记MSHR表中的地
+  //址block_addr的条目为就绪状态，即已经有了这个地址对应的数据。
   void mark_ready(new_addr_type block_addr, bool &has_atomic);
   /// Returns true if ready accesses exist
+  //如果存在就绪访问，则返回true。m_current_response是就绪内存访问的列表。m_current_response仅
+  //存储了就绪内存访问的地址。如果存在已经被填入MSHR条目的访问，则返回true。MSHR的条目非空证明可
+  //以合并内存访问。
+  //这里m_mshrs.access_ready()返回的是就绪内存访问的列表m_current_response是否非空，就绪内存访
+  //问的列表仅存储了就绪内存访问的地址。如果存在已经被填入MSHR条目的访问，则返回true。
   bool access_ready() const { return !m_current_response.empty(); }
   /// Returns next ready access
+  //返回下一个就绪访问。通常配合access_ready()一起使用，access_ready用来检查是否存在就绪访问，
+  //next_access()用来返回就绪访问：
+  //    bool access_ready() const { return !m_current_response.empty(); }
   mem_fetch *next_access();
   void display(FILE *fp) const;
   // Returns true if there is a pending read after write
+  //如果存在挂起的写后读请求，返回true。
   bool is_read_after_write_pending(new_addr_type block_addr);
 
   void check_mshr_parameters(unsigned num_entries, unsigned max_merged) {
@@ -1061,21 +1494,63 @@ class mshr_table {
  private:
   // finite sized, fully associative table, with a finite maximum number of
   // merged requests
+  //大小有限、完全关联的表，合并请求的最大数量有限。
   const unsigned m_num_entries;
+  //MSHR中的每个条目用来合并一个单独的内存访问地址mshr_addr，这个地址算法：
+  //  m_atom_sz = (m_cache_type == SECTOR) ? SECTOR_SIZE : m_line_sz; 其中 SECTOR_SIZE =  
+  //  const (32 bytes per sector).
+  //  1. 如果是SECTOR类型的cache：
+  //    mshr_addr函数返回mshr的地址，该地址即为地址addr的tag位+set index位+sector offset位。
+  //    即除single sector byte offset位以外的所有位+m_atom_sz'b0。
+  //    |<----------mshr_addr----------->|
+  //                       sector offset  off in-sector
+  //                       |-------------|-----------|
+  //                        \                       /
+  //                         \                     /
+  //    |-------|-------------|-------------------|
+  //       tag     set_index     offset in-line
+  //  2. 如果不是SECTOR类型的cache：
+  //    mshr_addr函数返回mshr的地址，该地址即为地址addr的tag位+set index位。即除single line 
+  //    byte offset位以外的所有位+m_atom_sz'b0。
+  //    |<----mshr_addr--->|
+  //                                line offset
+  //                       |-------------------------|
+  //                        \                       /
+  //                         \                     /
+  //    |-------|-------------|-------------------|
+  //       tag     set_index     offset in-line
+  //
+  //  mshr_addr定义：
+  //    new_addr_type mshr_addr(new_addr_type addr) const {
+  //      return addr & ~(new_addr_type)(m_atom_sz - 1);
+  //    }
+  //
+  //这里的m_num_entries其实是mshr的条目数，即可以合并多个内存访问地址mshr_addr，每个mshr_addr
+  //需要占用一个entry，而每个entry不能无限制的合并很多个地址，最大合并数m_max_merged。例如:
+  // GV100配置示例：
+  //   -gpgpu_cache:dl1  S:4:128:64,  L:T:m:L:L, A:512:8, 16:0,32
+  //   -gpgpu_cache:dl2  S:32:128:24, L:B:m:L:P, A:192:4, 32:0,32
+  //   -gpgpu_cache:il1  N:64:128:16, L:R:f:N:L, S:2:48,  4
+  // L1D、L2D、L1I的配置中，mshr的条目数分别为512、192和2，每个mshr的条目最多可以合并8、4和48个。
   const unsigned m_max_merged;
-
+  //MSHR表中的条目对象。
   struct mshr_entry {
+    //单个条目中可以合并的内存访问请求。
     std::list<mem_fetch *> m_list;
+    //单个条目是否是原子操作。
     bool m_has_atomic;
     mshr_entry() : m_has_atomic(false) {}
   };
+  // #define tr1_hash_map std::unordered_map
   typedef tr1_hash_map<new_addr_type, mshr_entry> table;
   typedef tr1_hash_map<new_addr_type, mshr_entry> line_table;
   table m_data;
   line_table pending_lines;
 
   // it may take several cycles to process the merged requests
+  //处理合并的请求可能需要几个周期。这个变量貌似没有用到。
   bool m_current_response_ready;
+  //就绪内存访问的列表。m_current_response仅存储了就绪内存访问的地址。
   std::list<new_addr_type> m_current_response;
 };
 
@@ -1258,6 +1733,9 @@ class cache_stats {
   unsigned long long m_cache_fill_port_busy_cycles;
 };
 
+/*
+cache的基础类，虚拟函数。
+*/
 class cache_t {
  public:
   virtual ~cache_t() {}
@@ -1277,8 +1755,10 @@ bool was_writeallocate_sent(const std::list<cache_event> &events);
 /// Baseline cache
 /// Implements common functions for read_only_cache and data_cache
 /// Each subclass implements its own 'access' function
+// 基础版Cache。实现read_only_cache和data_cache的通用功能。需要每个子类实现自己的“access”功能。
 class baseline_cache : public cache_t {
  public:
+  //构造函数。
   baseline_cache(const char *name, cache_config &config, int core_id,
                  int type_id, mem_fetch_interface *memport,
                  enum mem_fetch_status status, enum cache_gpu_level level,
@@ -1296,6 +1776,8 @@ class baseline_cache : public cache_t {
             mem_fetch_interface *memport, enum mem_fetch_status status) {
     m_name = name;
     assert(config.m_mshr_type == ASSOC || config.m_mshr_type == SECTOR_ASSOC);
+    //mem_fetch_interface是cache对mem访存的接口，cache将miss请求发送至下一级存储就是通过
+    //这个接口来发送，即m_miss_queue中的数据包需要压入m_memport实现发送至下一级存储。
     m_memport = memport;
     m_miss_queue_status = status;
   }
@@ -1321,6 +1803,17 @@ class baseline_cache : public cache_t {
   bool waiting_for_fill(mem_fetch *mf);
   /// Are any (accepted) accesses that had to wait for memory now ready? (does
   /// not include accesses that "HIT")
+  //未命中状态保持寄存器，the miss status holding register，MSHR。MSHR的模型是用mshr_table类来
+  //模拟一个具有有限数量的合并请求的完全关联表。请求通过next_access()函数从MSHR中释放。MSHR表具有
+  //固定数量的MSHR条目。每个MSHR条目可以为单个缓存行（cache line）提供固定数量的未命中请求。MSHR
+  //条目的数量和每个条目的最大请求数是可配置的。
+  //缓存未命中状态保持寄存器。缓存命中后，将立即向寄存器文件发送数据，以满足请求。在缓存未命中时，未
+  //命中处理逻辑将首先检查未命中状态保持寄存器（MSHR），以查看当前是否有来自先前请求的相同请求挂起。
+  //如果是，则此请求将合并到同一条目中，并且不需要发出新的数据请求。否则，将为该数据请求保留一个新的
+  //MSHR条目和缓存行。缓存状态处理程序可能会在资源不可用时失败，例如没有可用的MSHR条目、该集中的所
+  //有缓存块都已保留但尚未填充、未命中队列已满等。
+  //这里m_mshrs.access_ready()返回的是就绪内存访问的列表m_current_response是否非空，就绪内存访问
+  //的列表仅存储了就绪内存访问的地址。如果存在已经被填入MSHR条目的访问，则返回true。
   bool access_ready() const { return m_mshrs.access_ready(); }
   /// Pop next ready access (does not include accesses that "HIT")
   mem_fetch *next_access() { return m_mshrs.next_access(); }
@@ -1392,9 +1885,22 @@ class baseline_cache : public cache_t {
   std::string m_name;
   cache_config &m_config;
   tag_array *m_tag_array;
+  //未命中状态保持寄存器，the miss status holding register，MSHR。MSHR的模型是用mshr_table类来
+  //模拟一个具有有限数量的合并请求的完全关联表。请求通过next_access()函数从MSHR中释放。MSHR表具有
+  //固定数量的MSHR条目。每个MSHR条目可以为单个缓存行（cache line）提供固定数量的未命中请求。MSHR
+  //条目的数量和每个条目的最大请求数是可配置的。
+  //缓存未命中状态保持寄存器。缓存命中后，将立即向寄存器文件发送数据，以满足请求。在缓存未命中时，未
+  //命中处理逻辑将首先检查未命中状态保持寄存器（MSHR），以查看当前是否有来自先前请求的相同请求挂起。
+  //如果是，则此请求将合并到同一条目中，并且不需要发出新的数据请求。否则，将为该数据请求保留一个新的
+  //MSHR条目和缓存行。缓存状态处理程序可能会在资源不可用时失败，例如没有可用的MSHR条目、该集中的所
+  //有缓存块都已保留但尚未填充、未命中队列已满等。
   mshr_table m_mshrs;
+  //在baseline_cache::cycle()中，会将m_miss_queue队首的数据包mf传递给下一层缓存。当遇到miss的请求
+  //需要访问下一级存储时，会把miss的请求放到m_miss_queue中。
   std::list<mem_fetch *> m_miss_queue;
   enum mem_fetch_status m_miss_queue_status;
+  //mem_fetch_interface是cache对mem访存的接口，cache将miss请求发送至下一级存储就是通过这个接口来发
+  //送，即m_miss_queue中的数据包需要压入m_memport实现发送至下一级存储。
   mem_fetch_interface *m_memport;
   cache_gpu_level m_level;
   gpgpu_sim *m_gpu;
@@ -1408,6 +1914,14 @@ class baseline_cache : public cache_t {
       m_addr = ad;
       m_cache_index = i;
       m_data_size = d;
+      // 当一个 load 请求生成多个 load 事务时，使用此变量。例如，来自非 sectored L1 请求的读取请求
+      // 向 sectored L2 发送请求。这里的pending_read是指一个请求需要多少个load事务才能完成，每个事
+      // 务会以一个数据包mf的方式返回，当数据包填回cache时，会调用fill()函数，它会将pending_read减
+      // 1，当 pending_read 为 0 时，表示所有的load事务都完成了（当来一个数据包，但是经过减1还未清
+      // 零，证明还有pending_read个事务尚未返回数据包）。
+      // 这里是指非 sectored cache 的请求发送到一个 sectored cache时，需要多少个load事务才能完成，
+      // 因此如果 sectored cache 的块大小为m_line_sz，那么则需要m_line_sz / SECTOR_SIZE个load事
+      // 务。
       pending_read = m_config.m_mshr_type == SECTOR_ASSOC
                          ? m_config.m_line_sz / SECTOR_SIZE
                          : 0;
@@ -1420,6 +1934,8 @@ class baseline_cache : public cache_t {
     // this variable is used when a load request generates multiple load
     // transactions For example, a read request from non-sector L1 request sends
     // a request to sector L2
+    // 当加载请求生成多个加载事务时，使用此变量。例如，来自非sectored L1 请求的读取请求向
+    // sectored L2 发送请求。
     unsigned pending_read;
   };
 
@@ -1431,6 +1947,14 @@ class baseline_cache : public cache_t {
 
   /// Checks whether this request can be handled on this cycle. num_miss equals
   /// max # of misses to be handled on this cycle
+  //检查是否一个miss请求能够在当前时钟周期内被处理，m_miss_queue_size在V100的L1 cache
+  //中配置为16，在L2 cache中配置为32，当一个请求的大小大到m_miss_queue放不下时，它就在
+  //当前时钟周期内无法处理完毕。这里所说的能否在本时钟周期内处理完毕，仅是指能否将此miss
+  //请求放入m_miss_queue。在baseline_cache::cycle()中，会将m_miss_queue队首的数据包
+  //mf传递给下一层缓存。至于能否将这个miss请求在本时钟周期内发送至下一层缓存，就不是这里
+  //需要考虑的。
+  //在baseline_cache::cycle()中，会将m_miss_queue队首的数据包mf传递给下一层缓存。当遇
+  //到miss的请求需要访问下一级存储时，会把miss的请求放到m_miss_queue中。
   bool miss_queue_full(unsigned num_miss) {
     return ((m_miss_queue.size() + num_miss) >= m_config.m_miss_queue_size);
   }
@@ -1447,16 +1971,19 @@ class baseline_cache : public cache_t {
                          bool wa);
 
   /// Sub-class containing all metadata for port bandwidth management
+  //cache的子类，包含端口带宽管理的所有元数据。
   class bandwidth_management {
    public:
     bandwidth_management(cache_config &config);
 
     /// use the data port based on the outcome and events generated by the
     /// mem_fetch request
+    //根据mem_fetch请求生成的结果和事件使用数据端口。
     void use_data_port(mem_fetch *mf, enum cache_request_status outcome,
                        const std::list<cache_event> &events);
 
     /// use the fill port
+    //根据mem_fetch请求使用填充端口。
     void use_fill_port(mem_fetch *mf);
 
     /// called every cache cycle to free up the ports
@@ -1480,6 +2007,7 @@ class baseline_cache : public cache_t {
 };
 
 /// Read only cache
+// 只读Cache类。
 class read_only_cache : public baseline_cache {
  public:
   read_only_cache(const char *name, cache_config &config, int core_id,
@@ -1505,6 +2033,7 @@ class read_only_cache : public baseline_cache {
                        new_tag_array) {}
 };
 
+// 数据Cache类。实现 L1 和 L2 数据Cache的常用函数。
 /// Data cache - Implements common functions for L1 and L2 data cache
 class data_cache : public baseline_cache {
  public:
@@ -1534,6 +2063,7 @@ class data_cache : public baseline_cache {
 
     // Set write hit function
     switch (m_config.m_write_policy) {
+      // 在V100配置中，L1 cache为write-through，L2 cache为write-back。
       // READ_ONLY is now a separate cache class, config is deprecated
       case READ_ONLY:
         assert(0 && "Error: Writable Data_cache set as READ_ONLY\n");
@@ -1556,6 +2086,7 @@ class data_cache : public baseline_cache {
     }
 
     // Set write miss function
+    //V100中配置为LAZY_FETCH_ON_READ。
     switch (m_config.m_write_alloc_policy) {
       case NO_WRITE_ALLOCATE:
         m_wr_miss = &data_cache::wr_miss_no_wa;
@@ -1699,8 +2230,20 @@ class data_cache : public baseline_cache {
 /// It is write-evict (global) or write-back (local) at
 /// the granularity of individual blocks
 /// (the policy used in fermi according to the CUDA manual)
+// L1 cache采取的写策略：
+//     对L1 cache写不命中时，采用write-allocate策略，将缺失块从下级存储调入L1 cache，
+//                          并在L1 cache中修改。
+//     对L1 cache写命中时，采用write-back策略，只写入L1 cache，不直接写入下级存储，在
+//                          L1 cache的sector被逐出时才将数据写回下级缓存。
+// L2 cache采取的写策略：
+//     对L2 cache写不命中时，采用write-allocate策略，将缺失块从DRAM调入L2 cache，并在
+//                          L2 cache中修改。
+//     对L2 cache写命中时，采用write-back策略，只写入L2 cache，并不直接写入DRAM，在L2 
+//                          cache的sector被逐出时才将数据写回DRAM。
 class l1_cache : public data_cache {
  public:
+  //L1_WR_ALLOC_R/L2_WR_ALLOC_R在V100配置中暂时用不到。
+  //在V100中，L1 cache的m_write_policy为WRITE_THROUGH，实际上L1_WRBK_ACC也不会用到。
   l1_cache(const char *name, cache_config &config, int core_id, int type_id,
            mem_fetch_interface *memport, mem_fetch_allocator *mfcreator,
            enum mem_fetch_status status, class gpgpu_sim *gpu,
@@ -1715,6 +2258,8 @@ class l1_cache : public data_cache {
                                            std::list<cache_event> &events);
 
  protected:
+  //L1_WR_ALLOC_R/L2_WR_ALLOC_R在V100配置中暂时用不到。
+  //在V100中，L1 cache的m_write_policy为WRITE_THROUGH，实际上L1_WRBK_ACC也不会用到。
   l1_cache(const char *name, cache_config &config, int core_id, int type_id,
            mem_fetch_interface *memport, mem_fetch_allocator *mfcreator,
            enum mem_fetch_status status, tag_array *new_tag_array,
@@ -1725,12 +2270,25 @@ class l1_cache : public data_cache {
 
 /// Models second level shared cache with global write-back
 /// and write-allocate policies
+// L1 cache采取的写策略：
+//     对L1 cache写不命中时，采用write-allocate策略，将缺失块从下级存储调入L1 cache，
+//                          并在L1 cache中修改。
+//     对L1 cache写命中时，采用write-back策略，只写入L1 cache，不直接写入下级存储，在
+//                          L1 cache的sector被逐出时才将数据写回下级缓存。
+// L2 cache采取的写策略：
+//     对L2 cache写不命中时，采用write-allocate策略，将缺失块从DRAM调入L2 cache，并在
+//                          L2 cache中修改。
+//     对L2 cache写命中时，采用write-back策略，只写入L2 cache，并不直接写入DRAM，在L2 
+//                          cache的sector被逐出时才将数据写回DRAM。
 class l2_cache : public data_cache {
  public:
   l2_cache(const char *name, cache_config &config, int core_id, int type_id,
            mem_fetch_interface *memport, mem_fetch_allocator *mfcreator,
            enum mem_fetch_status status, class gpgpu_sim *gpu,
            enum cache_gpu_level level)
+      //在V100中，当L2 cache写不命中时，采取lazy_fetch_on_read策略，当找到一个cache block
+      //逐出时，如果这个cache block是被MODIFIED，则需要将这个cache block写回到下一级存储，
+      //因此会产生L2_WRBK_ACC访问，这个访问就是为了写回被逐出的MODIFIED cache block。
       : data_cache(name, config, core_id, type_id, memport, mfcreator, status,
                    L2_WR_ALLOC_R, L2_WRBK_ACC, gpu, level) {}
 
@@ -1764,6 +2322,8 @@ class tex_cache : public cache_t {
            config.m_mshr_type == SECTOR_TEX_FIFO);
     assert(config.m_write_policy == READ_ONLY);
     assert(config.m_alloc_policy == ON_MISS);
+    //mem_fetch_interface是cache对mem访存的接口，cache将miss请求发送至下一级存储就是通过
+    //这个接口来发送，即m_miss_queue中的数据包需要压入m_memport实现发送至下一级存储。
     m_memport = memport;
     m_cache = new data_block[config.get_num_lines()];
     m_request_queue_status = request_status;
@@ -1914,7 +2474,8 @@ class tex_cache : public cache_t {
   fifo<rob_entry> m_rob;
   data_block *m_cache;
   fifo<mem_fetch *> m_result_fifo;  // next completed texture fetch
-
+  //mem_fetch_interface是cache对mem访存的接口，cache将miss请求发送至下一级存储就是通过
+  //这个接口来发送，即m_miss_queue中的数据包需要压入m_memport实现发送至下一级存储。
   mem_fetch_interface *m_memport;
   enum mem_fetch_status m_request_queue_status;
   enum mem_fetch_status m_rob_status;
